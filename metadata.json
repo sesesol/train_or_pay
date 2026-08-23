@@ -1,0 +1,6 @@
+{
+  "name": "Trainieren oder zahlen",
+  "description": "Gym-Accountability-App für Freundesgruppen: Wöchentliche Trainingsziele setzen, Einheiten abhaken und bei Verfehlung Strafen an die Erfolgreichen zahlen.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
