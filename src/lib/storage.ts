@@ -15,8 +15,58 @@ declare global {
   }
 }
 
-// Fallback in-memory map for offline or standalone client preview
+const LOCAL_STORAGE_PREFIX = 'tz_gym_storage_';
 const clientFallbackMap: Record<string, string> = {};
+
+// Local storage helper
+function getLocalFallback(key: string): string | null {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const item = window.localStorage.getItem(LOCAL_STORAGE_PREFIX + key);
+      if (item !== null) return item;
+    }
+  } catch (_e) {}
+  return Object.prototype.hasOwnProperty.call(clientFallbackMap, key) ? clientFallbackMap[key] : null;
+}
+
+function setLocalFallback(key: string, value: string) {
+  clientFallbackMap[key] = value;
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(LOCAL_STORAGE_PREFIX + key, value);
+    }
+  } catch (_e) {}
+}
+
+function deleteLocalFallback(key: string) {
+  delete clientFallbackMap[key];
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.removeItem(LOCAL_STORAGE_PREFIX + key);
+    }
+  } catch (_e) {}
+}
+
+function listLocalFallback(prefix = ''): string[] {
+  const keys = new Set<string>();
+  Object.keys(clientFallbackMap).forEach((k) => {
+    if (k.startsWith(prefix)) keys.add(k);
+  });
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const fullKey = window.localStorage.key(i);
+        if (fullKey && fullKey.startsWith(LOCAL_STORAGE_PREFIX)) {
+          const rawKey = fullKey.slice(LOCAL_STORAGE_PREFIX.length);
+          if (rawKey.startsWith(prefix)) {
+            keys.add(rawKey);
+          }
+        }
+      }
+    }
+  } catch (_e) {}
+  return Array.from(keys);
+}
 
 // Ensure window.storage is initialized with shared backend support
 export function initWindowStoragePolyfill() {
@@ -29,27 +79,27 @@ export function initWindowStoragePolyfill() {
         try {
           const res = await fetch(`/api/storage/get?key=${encodeURIComponent(key)}`);
           if (!res.ok) {
-            // Check fallback map if server is unreachable
-            if (Object.prototype.hasOwnProperty.call(clientFallbackMap, key)) {
-              return clientFallbackMap[key];
-            }
+            const fallback = getLocalFallback(key);
+            if (fallback !== null) return fallback;
             throw new Error(`Key not found: ${key}`);
           }
           const data = await res.json();
           if (data && typeof data.value === 'string') {
+            setLocalFallback(key, data.value);
             return data.value;
           }
+          const fallback = getLocalFallback(key);
+          if (fallback !== null) return fallback;
           throw new Error(`Key not found: ${key}`);
         } catch (err: any) {
-          if (Object.prototype.hasOwnProperty.call(clientFallbackMap, key)) {
-            return clientFallbackMap[key];
-          }
+          const fallback = getLocalFallback(key);
+          if (fallback !== null) return fallback;
           throw new Error(err?.message || `Key not found: ${key}`);
         }
       },
 
       async set(key: string, value: string, _shared = true): Promise<void> {
-        clientFallbackMap[key] = value;
+        setLocalFallback(key, value);
         try {
           const res = await fetch('/api/storage/set', {
             method: 'POST',
@@ -57,41 +107,37 @@ export function initWindowStoragePolyfill() {
             body: JSON.stringify({ key, value }),
           });
           if (!res.ok) {
-            throw new Error(`Server returned status ${res.status}`);
+            console.warn(`Server returned status ${res.status} for key:`, key);
           }
         } catch (err: any) {
-          // If server fails, we still keep in fallback map but rethrow if critical
           console.warn('Network sync warning for set:', key, err);
         }
       },
 
       async list(prefix = '', _shared = true): Promise<string[]> {
+        const localKeys = listLocalFallback(prefix);
         try {
           const res = await fetch(`/api/storage/list?prefix=${encodeURIComponent(prefix)}`);
           if (!res.ok) {
-            const fallbackKeys = Object.keys(clientFallbackMap).filter((k) => k.startsWith(prefix));
-            return fallbackKeys;
+            return localKeys;
           }
           const data = await res.json();
           const serverKeys: string[] = data.keys || [];
-          const combined = Array.from(
-            new Set([...serverKeys, ...Object.keys(clientFallbackMap).filter((k) => k.startsWith(prefix))])
-          );
+          const combined = Array.from(new Set([...serverKeys, ...localKeys]));
           return combined;
-        } catch (err: any) {
-          const fallbackKeys = Object.keys(clientFallbackMap).filter((k) => k.startsWith(prefix));
-          return fallbackKeys;
+        } catch (_err: any) {
+          return localKeys;
         }
       },
 
       async delete(key: string, _shared = true): Promise<void> {
-        delete clientFallbackMap[key];
+        deleteLocalFallback(key);
         try {
           const res = await fetch(`/api/storage/delete?key=${encodeURIComponent(key)}`, {
             method: 'DELETE',
           });
           if (!res.ok && res.status !== 404) {
-            throw new Error(`Delete failed: ${key}`);
+            console.warn(`Delete warning: ${key}`);
           }
         } catch (err: any) {
           console.warn('Network sync warning for delete:', key, err);

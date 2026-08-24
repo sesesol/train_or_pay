@@ -30,6 +30,7 @@ interface SessionSettingsViewProps {
   usernameLower: string;
   openDebts: DebtItem[];
   onUpdateSessionMeta: (updated: SessionMeta) => Promise<void>;
+  onRunKassenabschluss?: (weekKey?: string) => Promise<any>;
   onLeaveSession: () => Promise<void>;
   onDeleteSession: () => Promise<void>;
   onSwitchSession: () => void;
@@ -44,6 +45,7 @@ export const SessionSettingsView: React.FC<SessionSettingsViewProps> = ({
   usernameLower,
   openDebts,
   onUpdateSessionMeta,
+  onRunKassenabschluss,
   onLeaveSession,
   onDeleteSession,
   onSwitchSession,
@@ -286,6 +288,33 @@ export const SessionSettingsView: React.FC<SessionSettingsViewProps> = ({
               />
             </button>
           </div>
+
+          {onRunKassenabschluss && (
+            <div className="p-4 bg-black/40 border border-white/10 rounded-2xl flex items-center justify-between gap-3">
+              <div className="flex flex-col">
+                <span className="text-xs font-black uppercase tracking-wider text-white">Sofortiger Kassenabschluss</span>
+                <span className="text-[11px] text-white/50 mt-0.5">
+                  Berechnet und verbucht die Wochen-Strafen sofort ins Schuldenbuch
+                </span>
+              </div>
+
+              <button
+                type="button"
+                id="admin-run-kassenabschluss-btn"
+                onClick={async () => {
+                  try {
+                    await onRunKassenabschluss();
+                    onSuccess('Kassenabschluss erfolgreich ausgeführt!');
+                  } catch (e: any) {
+                    onError('Fehler beim Kassenabschluss: ' + e?.message);
+                  }
+                }}
+                className="px-4 py-2 bg-[#DFFF00] hover:scale-[1.02] active:scale-95 text-black text-xs font-black uppercase tracking-wider rounded-xl cursor-pointer shadow-md transition-transform shrink-0"
+              >
+                Ausführen
+              </button>
+            </div>
+          )}
         </div>
       )}
 

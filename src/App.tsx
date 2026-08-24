@@ -90,19 +90,46 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Load user sessions list from storage
+  // Load user sessions list from storage (thorough scan to ensure zero data loss)
   const loadUserSessions = useCallback(
     async (userLower: string, sessionCodes: string[]): Promise<SessionMeta[]> => {
-      const loaded: SessionMeta[] = [];
-      for (const code of sessionCodes) {
+      const loadedMap = new Map<string, SessionMeta>();
+
+      // 1. Load by explicit session codes from user profile
+      for (const code of sessionCodes || []) {
         try {
           const session = await storageGet<SessionMeta>(`session:${code}:meta`);
-          if (session) loaded.push(session);
+          if (session && session.code) {
+            loadedMap.set(session.code, session);
+          }
         } catch (_e) {
           // ignore missing
         }
       }
-      return loaded;
+
+      // 2. Scan all session keys to discover any session where the user is an active member
+      try {
+        const allSessionKeys = await storageList('session:');
+        const metaKeys = allSessionKeys.filter((k) => k.endsWith(':meta'));
+        for (const mKey of metaKeys) {
+          const code = mKey.replace('session:', '').replace(':meta', '');
+          if (!loadedMap.has(code)) {
+            const session = await storageGet<SessionMeta>(mKey);
+            if (session && session.code) {
+              const isMember = session.members?.some(
+                (m) => m.user.toLowerCase() === userLower.toLowerCase() && m.active
+              );
+              if (isMember) {
+                loadedMap.set(session.code, session);
+              }
+            }
+          }
+        }
+      } catch (_e) {
+        // ignore scan errors
+      }
+
+      return Array.from(loadedMap.values());
     },
     []
   );
@@ -450,6 +477,156 @@ export default function App() {
     }
   };
 
+  // Manual / Anytime Kassenabschluss (Abrechnung durchführen)
+  const handleRunKassenabschluss = async (targetWeekKey?: string): Promise<WeekSettlement> => {
+    if (!currentSession) throw new Error('Keine aktive Gruppe.');
+    const code = currentSession.code;
+    const weekKey = targetWeekKey || currentWeekKey;
+
+    // Load member week inputs
+    const memberInputs = [];
+    for (const member of currentSession.members) {
+      if (!member.active) continue;
+      const mLower = member.user.toLowerCase();
+      const userWeekKey = `session:${code}:week:${weekKey}:user:${mLower}`;
+      const uData = await storageGet<UserWeekData>(userWeekKey);
+
+      memberInputs.push({
+        user: mLower,
+        displayName: member.displayName,
+        goal: uData ? uData.goal : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.goal ?? 3) : 0),
+        completed: uData ? (uData.checks?.length || 0) : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.checks?.length || 0) : 0),
+        penaltyCents: uData?.penaltyCentsSnapshot || member.penaltyCents,
+        joinedMidWeek: uData?.joinedMidWeek || false,
+      });
+    }
+
+    const settlement = calculateWeekSettlement(weekKey, memberInputs);
+    const settlementKey = `session:${code}:week:${weekKey}:settlement`;
+    await storageSet(settlementKey, settlement);
+
+    // Update debts
+    let debtsStore = (await storageGet<DebtsStorage>(`session:${code}:debts`)) || {
+      open: [],
+      history: [],
+    };
+
+    // Remove any previously generated open items for this week to prevent duplicates if re-settled
+    const filteredOpen = debtsStore.open.filter((d) => d.weekKey !== weekKey);
+
+    for (const entry of settlement.entries) {
+      const newDebtItem: DebtItem = {
+        id: `debt-${code}-${weekKey}-${entry.from}-${entry.to}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+        from: entry.from,
+        to: entry.to,
+        amountCents: entry.amountCents,
+        weekKey: weekKey,
+        status: 'open',
+        createdAt: new Date().toISOString(),
+      };
+      filteredOpen.push(newDebtItem);
+    }
+
+    const updatedDebtsStore: DebtsStorage = {
+      open: filteredOpen,
+      history: debtsStore.history,
+    };
+    await storageSet(`session:${code}:debts`, updatedDebtsStore);
+
+    setOpenDebts(filteredOpen);
+    setSettlements((prev) => [settlement, ...prev.filter((s) => s.weekKey !== weekKey)]);
+
+    addToast('success', `Kassenabschluss für KW ${weekKey.replace('2026-W', '')} erfolgreich verbucht!`);
+    await refreshSessionData(currentSession, usernameLower);
+    return settlement;
+  };
+
+  // Direct Payment / Anytime Settlement (Jederzeit direkt zahlen & ausgleichen)
+  const handleRecordDirectPayment = async (
+    fromUser: string,
+    toUser: string,
+    amountCents: number,
+    _memo?: string
+  ) => {
+    if (!currentSession) return;
+    const code = currentSession.code;
+    const fromLower = fromUser.toLowerCase();
+    const toLower = toUser.toLowerCase();
+
+    let debtsStore = (await storageGet<DebtsStorage>(`session:${code}:debts`)) || {
+      open: [],
+      history: [],
+    };
+
+    let remainingToPay = amountCents;
+    const updatedOpen: DebtItem[] = [];
+
+    // First, offset matching open debts where fromLower owes toLower
+    for (const item of debtsStore.open) {
+      if (
+        item.status !== 'paid' &&
+        item.from.toLowerCase() === fromLower &&
+        item.to.toLowerCase() === toLower &&
+        remainingToPay > 0
+      ) {
+        if (remainingToPay >= item.amountCents) {
+          // Fully pay this item
+          remainingToPay -= item.amountCents;
+          debtsStore.history.unshift({
+            ...item,
+            status: 'paid',
+            paidAt: new Date().toISOString(),
+          });
+        } else {
+          // Partially pay this item
+          const paidPart: DebtItem = {
+            id: `${item.id}-part-${Date.now()}`,
+            from: item.from,
+            to: item.to,
+            amountCents: remainingToPay,
+            weekKey: item.weekKey,
+            status: 'paid',
+            createdAt: item.createdAt,
+            paidAt: new Date().toISOString(),
+          };
+          debtsStore.history.unshift(paidPart);
+
+          updatedOpen.push({
+            ...item,
+            amountCents: item.amountCents - remainingToPay,
+            status: 'open',
+          });
+          remainingToPay = 0;
+        }
+      } else {
+        updatedOpen.push(item);
+      }
+    }
+
+    // If there is still extra paid or no open debt existed, record as a direct settled payment
+    if (remainingToPay > 0 || (amountCents > 0 && debtsStore.open.length === updatedOpen.length)) {
+      debtsStore.history.unshift({
+        id: `direct-pay-${code}-${fromLower}-${toLower}-${Date.now()}`,
+        from: fromLower,
+        to: toLower,
+        amountCents: remainingToPay > 0 ? remainingToPay : amountCents,
+        weekKey: currentWeekKey,
+        status: 'paid',
+        createdAt: new Date().toISOString(),
+        paidAt: new Date().toISOString(),
+      });
+    }
+
+    const finalStore: DebtsStorage = {
+      open: updatedOpen,
+      history: debtsStore.history,
+    };
+
+    await storageSet(`session:${code}:debts`, finalStore);
+    setOpenDebts(updatedOpen);
+    setPaymentHistory(debtsStore.history);
+  };
+
   // Helper to seed Section 7.4 Demo Group
   const handleSeedDemoGroup = async () => {
     if (!currentUser || !usernameLower) return;
@@ -581,7 +758,11 @@ export default function App() {
                 usernameLower={usernameLower}
                 openDebts={openDebts}
                 paymentHistory={paymentHistory}
+                currentWeekKey={currentWeekKey}
+                allMembersCurrentWeek={allMembersCurrentWeek}
                 onUpdateDebts={handleUpdateDebts}
+                onRunKassenabschluss={handleRunKassenabschluss}
+                onRecordDirectPayment={handleRecordDirectPayment}
                 onError={(msg) => addToast('error', msg)}
                 onSuccess={(msg) => addToast('success', msg)}
               />
@@ -603,6 +784,7 @@ export default function App() {
                 usernameLower={usernameLower}
                 openDebts={openDebts}
                 onUpdateSessionMeta={handleUpdateSessionMeta}
+                onRunKassenabschluss={handleRunKassenabschluss}
                 onLeaveSession={handleLeaveSession}
                 onDeleteSession={handleDeleteSession}
                 onSwitchSession={() => setShowSessionModal(true)}

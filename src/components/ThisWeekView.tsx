@@ -19,6 +19,8 @@ import {
   Trophy,
   Flame,
   ShieldCheck,
+  Lock,
+  Edit3,
 } from 'lucide-react';
 import {
   SessionMeta,
@@ -78,11 +80,11 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
   const currentMember = session.members.find((m) => m.user.toLowerCase() === usernameLower);
   const currentPenaltyCents = currentMember?.penaltyCents || 500;
 
-  // Local state for goal setting steppers
-  const [isEditingGoal, setIsEditingGoal] = useState(false);
-  const [selectedGoal, setSelectedGoal] = useState<number>(myCurrentWeekData.goal);
-  const [nextWeekGoal, setNextWeekGoal] = useState<number>(myNextWeekData ? myNextWeekData.goal : 3);
-  const [selectedCheckDetail, setSelectedCheckDetail] = useState<{ index: number; check: WorkoutCheck } | null>(null);
+  // Local state for next week planning stepper
+  const [nextWeekGoal, setNextWeekGoal] = useState<number>(
+    myNextWeekData ? myNextWeekData.goal : 3
+  );
+  const [isEditingNextWeek, setIsEditingNextWeek] = useState<boolean>(false);
 
   const daysRemaining = getDaysRemainingInWeek(now);
   const weekRange = getWeekDateRange(currentWeekKey);
@@ -159,23 +161,6 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
     }
   };
 
-  const handleSaveCurrentGoal = async (newGoal: number) => {
-    if (isAfterMonday && newGoal < myCurrentWeekData.goal) {
-      onError('Ab Dienstag kann das Wochenziel nur noch erhöht, nicht mehr gesenkt werden.');
-      return;
-    }
-
-    const updated: UserWeekData = {
-      ...myCurrentWeekData,
-      goal: newGoal,
-      penaltyCentsSnapshot: myCurrentWeekData.penaltyCentsSnapshot || currentPenaltyCents,
-    };
-
-    await onUpdateMyWeekData(currentWeekKey, updated);
-    setIsEditingGoal(false);
-    onSuccess(`Wochenziel auf ${newGoal} ${newGoal === 1 ? 'Einheit' : 'Einheiten'} aktualisiert.`);
-  };
-
   const handleSaveNextWeekGoal = async (newGoal: number) => {
     const updated: UserWeekData = {
       goal: newGoal,
@@ -183,7 +168,12 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
       penaltyCentsSnapshot: currentPenaltyCents,
     };
     await onUpdateMyWeekData(nextWeekKey, updated);
-    onSuccess(`Ziel für nächste Woche (${nextWeekKey}) auf ${newGoal} Einheiten festgelegt.`);
+    setIsEditingNextWeek(false);
+    onSuccess(
+      newGoal === 0
+        ? `Nächste Woche (${nextWeekKey}) erfolgreich als pausiert festgelegt.`
+        : `Ziel für nächste Woche (${nextWeekKey}) auf ${newGoal} ${newGoal === 1 ? 'Einheit' : 'Einheiten'} festgelegt.`
+    );
   };
 
   return (
@@ -257,22 +247,12 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
 
         {/* CIRCLES GRID */}
         {currentGoal === 0 ? (
-          <div className="relative z-10 py-8 px-4 bg-white/5 border border-dashed border-white/10 rounded-2xl text-center flex flex-col items-center gap-2">
+          <div className="relative z-10 py-8 px-4 bg-white/5 border border-dashed border-white/10 rounded-2xl text-center flex flex-col items-center gap-3">
             <span className="text-3xl">🛋️</span>
             <p className="text-base font-black uppercase tracking-wider text-white">Diese Woche pausiert</p>
             <p className="text-xs text-white/50 max-w-xs leading-relaxed">
-              Ziel ist auf 0 gesetzt. Du zahlst keine Strafe und erhältst keine Auszahlung.
+              Dein Ziel für die laufende Woche ist auf 0 Einheiten fixiert. Du zahlst keine Strafe und erhältst keine Auszahlung.
             </p>
-            {(isLateWindow || !isAfterMonday) && (
-              <button
-                type="button"
-                id="start-training-now-btn"
-                onClick={() => handleSaveCurrentGoal(3)}
-                className="mt-3 px-6 py-3 bg-[#DFFF00] hover:scale-[1.02] active:scale-95 text-black font-black uppercase tracking-wider text-xs rounded-2xl shadow-lg cursor-pointer transition-transform"
-              >
-                Doch mittrainieren (Ziel setzen)
-              </button>
-            )}
           </div>
         ) : (
           <div className="relative z-10 flex flex-col gap-4">
@@ -329,135 +309,113 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
           </div>
         )}
 
-        {/* Goal Adjustment Controls */}
-        <div className="relative z-10 pt-2 border-t border-white/10">
-          {!isEditingGoal ? (
-            <div className="flex items-center justify-between">
-              <span className="text-xs text-white/60">
-                Wochenziel: <strong className="text-white font-black">{currentGoal} Einheiten</strong>
-                {isAfterMonday && ' (Nur noch Erhöhung möglich)'}
-              </span>
-              <button
-                type="button"
-                id="edit-current-goal-btn"
-                onClick={() => {
-                  setSelectedGoal(currentGoal);
-                  setIsEditingGoal(true);
-                }}
-                className="text-xs font-black uppercase tracking-wider text-[#DFFF00] hover:underline underline-offset-4 py-1 px-2 cursor-pointer"
-              >
-                Ziel anpassen
-              </button>
-            </div>
-          ) : (
-            <div className="p-4 bg-black/50 border border-white/10 rounded-2xl flex flex-col gap-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-bold uppercase tracking-wider text-white/70">Laufendes Ziel:</span>
-                <span className="text-xl font-black text-[#DFFF00] font-mono">{selectedGoal}</span>
-              </div>
+        {/* Goal Status (Locked for current week) */}
+        <div className="relative z-10 pt-3 border-t border-white/10 flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-white/60">
+              Wochenziel: <strong className="text-white font-black">{currentGoal} {currentGoal === 1 ? 'Einheit' : 'Einheiten'}</strong>
+            </span>
+          </div>
 
-              <div className="flex items-center justify-center gap-3">
-                <button
-                  type="button"
-                  id="goal-minus-btn"
-                  disabled={isAfterMonday && selectedGoal <= currentGoal}
-                  onClick={() => setSelectedGoal((prev) => Math.max(0, prev - 1))}
-                  className="w-11 h-11 rounded-xl bg-white/10 hover:bg-white/20 disabled:opacity-20 disabled:cursor-not-allowed text-white flex items-center justify-center text-lg font-bold"
-                >
-                  <Minus className="w-5 h-5" />
-                </button>
-
-                <div className="flex gap-1.5">
-                  {[1, 2, 3, 4, 5].map((num) => (
-                    <button
-                      key={num}
-                      type="button"
-                      disabled={isAfterMonday && num < currentGoal}
-                      onClick={() => setSelectedGoal(num)}
-                      className={`w-9 h-11 rounded-xl text-xs font-black font-mono transition-colors ${
-                        selectedGoal === num
-                          ? 'bg-[#DFFF00] text-black'
-                          : 'bg-white/5 hover:bg-white/10 text-white/70 disabled:opacity-20'
-                      }`}
-                    >
-                      {num}
-                    </button>
-                  ))}
-                </div>
-
-                <button
-                  type="button"
-                  id="goal-plus-btn"
-                  disabled={selectedGoal >= 14}
-                  onClick={() => setSelectedGoal((prev) => Math.min(14, prev + 1))}
-                  className="w-11 h-11 rounded-xl bg-white/10 hover:bg-white/20 disabled:opacity-20 disabled:cursor-not-allowed text-white flex items-center justify-center text-lg font-bold"
-                >
-                  <Plus className="w-5 h-5" />
-                </button>
-              </div>
-
-              <div className="flex justify-end gap-2 mt-2">
-                <button
-                  type="button"
-                  onClick={() => setIsEditingGoal(false)}
-                  className="px-4 py-2 text-xs font-bold uppercase tracking-wider text-white/40 hover:text-white"
-                >
-                  Abbrechen
-                </button>
-                <button
-                  type="button"
-                  id="save-current-goal-btn"
-                  onClick={() => handleSaveCurrentGoal(selectedGoal)}
-                  className="px-5 py-2 bg-[#DFFF00] hover:scale-[1.02] text-black text-xs font-black uppercase tracking-wider rounded-xl shadow-md transition-transform cursor-pointer"
-                >
-                  Speichern
-                </button>
-              </div>
-            </div>
-          )}
+          <span className="text-[11px] font-mono font-bold text-white/50 bg-white/10 px-2.5 py-1 rounded-lg border border-white/10 flex items-center gap-1.5 select-none">
+            <Lock className="w-3.5 h-3.5 text-[#DFFF00]" />
+            Laufende Woche fixiert
+          </span>
         </div>
       </div>
 
-      {/* PROMINENT NEXT WEEK PLANNING CALLOUT (Sat/Sun/Mon) */}
-      {(isPlanning || isLateWindow) && (
-        <div
-          id="planning-window-card"
-          className="bg-white/5 border-2 border-[#DFFF00]/40 rounded-3xl p-6 shadow-xl flex flex-col gap-4 relative overflow-hidden"
-        >
-          <div className="flex items-center justify-between">
+      {/* PROMINENT NEXT WEEK PLANNING & EDITING CARD */}
+      <div
+        id="planning-window-card"
+        className="bg-white/5 border-2 border-[#DFFF00]/40 rounded-3xl p-6 shadow-xl flex flex-col gap-4 relative overflow-hidden"
+      >
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-[#DFFF00]" />
+            <h3 className="text-base font-black uppercase tracking-tight text-white">Nächste Woche planen & bearbeiten</h3>
+          </div>
+          <span className="text-xs font-mono font-black text-[#DFFF00] bg-[#DFFF00]/10 border border-[#DFFF00]/20 px-2.5 py-1 rounded-lg uppercase tracking-wider">
+            KW {nextWeekKey.replace('2026-W', '')} • {nextWeekRange.fullRange}
+          </span>
+        </div>
+
+        <p className="text-xs text-white/60 leading-relaxed">
+          Wähle dein Trainingsziel für die kommende Woche (1 bis 7 Einheiten oder pausieren). Du kannst diesen Wert <strong className="text-white">jederzeit vor Beginn der nächsten Woche beliebig bearbeiten und anpassen</strong>.
+        </p>
+
+        {/* Current status of next week */}
+        {myNextWeekData && (
+          <div className="flex items-center justify-between p-3 bg-white/5 border border-white/10 rounded-xl">
             <div className="flex items-center gap-2">
-              <Sparkles className="w-5 h-5 text-[#DFFF00]" />
-              <h3 className="text-base font-black uppercase tracking-tight text-white">Nächste Woche planen</h3>
+              <Check className="w-4 h-4 text-[#DFFF00]" />
+              <span className="text-xs font-medium text-white/80">
+                Aktuell geplantes Ziel: <strong className="text-white font-mono font-bold">{myNextWeekData.goal === 0 ? 'Pausiert (0 Einheiten)' : `${myNextWeekData.goal} ${myNextWeekData.goal === 1 ? 'Einheit' : 'Einheiten'}`}</strong>
+              </span>
             </div>
-            <span className="text-xs font-mono font-bold text-[#DFFF00] uppercase tracking-wider">KW {nextWeekKey.replace('2026-W', '')}</span>
+            <span className="text-[10px] font-mono text-[#DFFF00] font-bold uppercase tracking-wider bg-[#DFFF00]/10 px-2 py-0.5 rounded border border-[#DFFF00]/20">
+              Jederzeit änderbar
+            </span>
+          </div>
+        )}
+
+        <div className="flex flex-col gap-3 bg-black/40 p-4 sm:p-5 rounded-2xl border border-white/10">
+          <div className="flex items-center justify-between">
+            <span className="text-xs uppercase tracking-wider text-white/60 font-bold">Neues Wochenziel auswählen:</span>
+            <span className="text-2xl font-black text-[#DFFF00] font-mono">
+              {nextWeekGoal === 0 ? '0 (Pausiert)' : `${nextWeekGoal} ${nextWeekGoal === 1 ? 'Einheit' : 'Einheiten'}`}
+            </span>
           </div>
 
-          <p className="text-xs text-white/60 leading-relaxed">
-            Planungsfenster geöffnet ({nextWeekRange.fullRange}). Lege fest, wie oft du nächste Woche trainieren wirst.
-          </p>
+          {/* Quick preset chips including 0 / Pausieren */}
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button
+              type="button"
+              id="next-week-pause-chip"
+              onClick={() => setNextWeekGoal(0)}
+              className={`px-3 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer ${
+                nextWeekGoal === 0
+                  ? 'bg-amber-400 text-black shadow-md scale-105'
+                  : 'bg-white/10 hover:bg-white/20 text-white/80'
+              }`}
+            >
+              🛋️ 0 (Pause)
+            </button>
 
-          <div className="flex items-center justify-between bg-black/40 p-3 rounded-2xl border border-white/10">
-            <span className="text-xs uppercase tracking-wider text-white/50 font-bold">Einheiten:</span>
+            {[1, 2, 3, 4, 5, 6, 7].map((num) => (
+              <button
+                key={num}
+                type="button"
+                id={`next-week-goal-${num}`}
+                onClick={() => setNextWeekGoal(num)}
+                className={`w-10 h-10 rounded-xl text-sm font-black font-mono transition-all cursor-pointer ${
+                  nextWeekGoal === num
+                    ? 'bg-[#DFFF00] text-black shadow-md scale-105'
+                    : 'bg-white/10 hover:bg-white/20 text-white'
+                }`}
+              >
+                {num}
+              </button>
+            ))}
+          </div>
 
+          {/* Stepper + Save / Update Button */}
+          <div className="flex items-center justify-between flex-wrap gap-3 pt-3 border-t border-white/10">
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 id="next-week-goal-minus"
+                disabled={nextWeekGoal <= 0}
                 onClick={() => setNextWeekGoal((g) => Math.max(0, g - 1))}
-                className="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/20 text-white flex items-center justify-center font-bold"
+                className="w-10 h-10 rounded-xl bg-white/10 hover:bg-white/20 disabled:opacity-20 text-white flex items-center justify-center font-bold text-lg"
               >
                 <Minus className="w-4 h-4" />
               </button>
-
-              <span className="w-8 text-center text-xl font-black text-[#DFFF00] font-mono">
-                {nextWeekGoal}
-              </span>
-
               <button
                 type="button"
                 id="next-week-goal-plus"
-                onClick={() => setNextWeekGoal((g) => Math.min(14, g + 1))}
-                className="w-9 h-9 rounded-xl bg-white/10 hover:bg-white/20 text-white flex items-center justify-center font-bold"
+                disabled={nextWeekGoal >= 7}
+                onClick={() => setNextWeekGoal((g) => Math.min(7, g + 1))}
+                className="w-10 h-10 rounded-xl bg-white/10 hover:bg-white/20 disabled:opacity-20 text-white flex items-center justify-center font-bold text-lg"
               >
                 <Plus className="w-4 h-4" />
               </button>
@@ -467,13 +425,14 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
               type="button"
               id="save-next-week-goal-btn"
               onClick={() => handleSaveNextWeekGoal(nextWeekGoal)}
-              className="px-5 py-2.5 bg-[#DFFF00] hover:scale-[1.02] text-black font-black text-xs uppercase tracking-wider rounded-xl shadow-md cursor-pointer transition-transform"
+              className="px-6 py-3 bg-[#DFFF00] hover:scale-[1.02] active:scale-95 text-black font-black text-xs uppercase tracking-wider rounded-xl shadow-lg cursor-pointer transition-transform flex items-center gap-2"
             >
-              Festlegen
+              <Edit3 className="w-4 h-4" />
+              <span>{myNextWeekData ? 'Ziel für nächste Woche aktualisieren' : 'Ziel für nächste Woche festlegen'}</span>
             </button>
           </div>
         </div>
-      )}
+      </div>
 
       {/* TEAM OVERVIEW: ALL MEMBERS IN THIS SESSION */}
       <div id="team-overview-section" className="flex flex-col gap-4">
