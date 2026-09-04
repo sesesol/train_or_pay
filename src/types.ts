@@ -4,6 +4,7 @@
  */
 
 export interface UserProfile {
+  id: string; // Permanent, immutable user id (UUID). Never changes, even across devices/logins.
   displayName: string;
   pinHash: string | null;
   createdAt: string;
@@ -11,7 +12,8 @@ export interface UserProfile {
 }
 
 export interface SessionMember {
-  user: string; // Lowercase username identifier
+  user: string; // Lowercase username identifier (stable join key, unique per account)
+  userId?: string; // Permanent user id of the member (mirrors UserProfile.id). Backfilled for legacy data.
   displayName: string;
   joinedAt: string;
   penaltyCents: number; // Penalty per missed workout in cents (e.g. 500 = 5.00 €)

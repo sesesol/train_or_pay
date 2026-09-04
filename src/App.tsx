@@ -20,6 +20,12 @@ import {
   initWindowStoragePolyfill,
 } from './lib/storage.ts';
 import {
+  ensureUserId,
+  saveLoginSession,
+  readLoginSession,
+  clearLoginSession,
+} from './lib/session.ts';
+import {
   getBerlinISOWeek,
   getNextBerlinISOWeek,
   getPreviousBerlinISOWeek,
@@ -39,6 +45,56 @@ export default function App() {
   // Polyfill initialization
   useEffect(() => {
     initWindowStoragePolyfill();
+  }, []);
+
+  // Attempt to restore a persisted login session on startup. The persisted
+  // record is only a pointer (user_id + username); the actual account is always
+  // re-loaded fresh from the database, which remains the source of truth.
+  useEffect(() => {
+    let cancelled = false;
+
+    const restore = async () => {
+      const record = readLoginSession();
+      if (!record) {
+        if (!cancelled) setIsRestoringSession(false);
+        return;
+      }
+
+      try {
+        const dbProfile = await storageGet<UserProfile>(`user:${record.usernameLower}`);
+
+        // Only auto-login if the account still exists AND matches the stored
+        // permanent id (guards against a reused/renamed username on the server).
+        if (dbProfile && (!dbProfile.id || dbProfile.id === record.userId)) {
+          if (cancelled) return;
+          // Parse a possible ?join=CODE / #join=CODE invite so it still works.
+          let prefill: string | undefined;
+          try {
+            const src = `${window.location.hash} ${window.location.search}`;
+            const match = src.match(/join=([A-Za-z0-9]+)/);
+            if (match && match[1]) prefill = match[1].toUpperCase();
+          } catch (_e) {
+            // ignore
+          }
+          setIsRestoringSession(false);
+          await handleLoginSuccess(dbProfile, record.usernameLower, prefill);
+          return;
+        }
+
+        // Stored session no longer valid -> drop it, fall back to manual login.
+        clearLoginSession();
+      } catch (_e) {
+        // Could not reach the database; leave the pointer in place and let the
+        // user log in manually (no data is lost either way).
+      }
+      if (!cancelled) setIsRestoringSession(false);
+    };
+
+    restore();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Global Auth state
@@ -74,6 +130,7 @@ export default function App() {
   // UI state
   const [isLoadingSession, setIsLoadingSession] = useState<boolean>(false);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [isRestoringSession, setIsRestoringSession] = useState<boolean>(true);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const addToast = (type: 'error' | 'success' | 'info', text: string, onRetry?: () => void) => {
@@ -300,13 +357,28 @@ export default function App() {
     userLower: string,
     prefillCode?: string
   ) => {
-    setCurrentUser(profile);
+    // Guarantee a permanent user_id. Legacy accounts created before this field
+    // existed get one assigned once and persisted back to the database.
+    const { profile: ensuredProfile, changed } = ensureUserId(profile);
+    if (changed) {
+      try {
+        await storageSet(`user:${userLower}`, ensuredProfile);
+      } catch (_e) {
+        // Non-fatal: keep the id in memory for this session; retried next login.
+      }
+    }
+
+    setCurrentUser(ensuredProfile);
     setUsernameLower(userLower);
     setPrefillJoinCode(prefillCode);
 
+    // Persist a supporting login-session pointer on this device so a returning
+    // user is auto-recognised. The database stays the source of truth.
+    saveLoginSession(ensuredProfile, userLower);
+
     setIsLoadingSession(true);
     try {
-      const sessions = await loadUserSessions(userLower, profile.sessions || []);
+      const sessions = await loadUserSessions(userLower, ensuredProfile.sessions || []);
       setUserSessions(sessions);
 
       if (prefillCode) {
@@ -675,6 +747,17 @@ export default function App() {
     addToast('success', '7.4 Demo-Gruppe mit Ali, Bea & Cem geladen!');
   };
 
+  // While restoring a persisted login session, show a loader instead of
+  // briefly flashing the login screen.
+  if (isRestoringSession && (!currentUser || !usernameLower)) {
+    return (
+      <div className="min-h-screen bg-[#0A0A0A] flex flex-col items-center justify-center p-4 text-white">
+        <Loader2 className="w-10 h-10 text-[#DFFF00] animate-spin mb-3 stroke-[2.5]" />
+        <p className="text-xs font-black uppercase tracking-widest text-white/60">Sitzung wird wiederhergestellt...</p>
+      </div>
+    );
+  }
+
   // Not logged in -> Show Auth Screen
   if (!currentUser || !usernameLower) {
     return (
@@ -834,10 +917,12 @@ export default function App() {
           }}
           onError={(msg) => addToast('error', msg)}
           onLogout={() => {
+            clearLoginSession();
             setCurrentUser(null);
             setUsernameLower('');
             setCurrentSession(null);
             setShowSessionModal(false);
+            setUserSessions([]);
           }}
         />
       )}

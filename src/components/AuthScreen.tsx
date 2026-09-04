@@ -7,6 +7,7 @@ import React, { useState, useEffect } from 'react';
 import { Dumbbell, ShieldAlert, ArrowRight, UserPlus, Lock, Sparkles } from 'lucide-react';
 import { UserProfile } from '../types.ts';
 import { storageGet, storageSet } from '../lib/storage.ts';
+import { generateUserId } from '../lib/session.ts';
 
 interface AuthScreenProps {
   onLoginSuccess: (userProfile: UserProfile, usernameLower: string, prefillJoinCode?: string) => void;
@@ -109,9 +110,10 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess, onError 
         await updateRecentUsers(existingUser.displayName);
         onLoginSuccess(existingUser, usernameLower, prefillJoinCode);
       } else {
-        // New user creation flow
+        // New user creation flow — assign a permanent, immutable user id now.
         setPendingUsernameLower(usernameLower);
         setPendingProfile({
+          id: generateUserId(),
           displayName: trimmed,
           pinHash: null,
           createdAt: new Date().toISOString(),
@@ -161,18 +163,36 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess, onError 
       pin = cleanPin;
     }
 
-    const newProfile: UserProfile = {
-      ...pendingProfile,
-      pinHash: pin,
-      createdAt: new Date().toISOString(),
-    };
-
     try {
+      // Guard against races / duplicates: another device may have created this
+      // exact username between the first lookup and now. Re-check the database
+      // immediately before inserting so we never overwrite an existing account
+      // (which would wipe its groups). If it now exists, treat as a login.
+      const raced = await storageGet<UserProfile>(`user:${pendingUsernameLower}`);
+      if (raced) {
+        if (raced.pinHash) {
+          setPendingProfile(raced);
+          setStep('pin_verify');
+          setPinInput('');
+          setIsLoading(false);
+          return;
+        }
+        await updateRecentUsers(raced.displayName);
+        onLoginSuccess(raced, pendingUsernameLower, prefillJoinCode);
+        return;
+      }
+
+      const newProfile: UserProfile = {
+        ...pendingProfile,
+        pinHash: pin,
+        createdAt: new Date().toISOString(),
+      };
+
       await storageSet(`user:${pendingUsernameLower}`, newProfile);
       await updateRecentUsers(newProfile.displayName);
       onLoginSuccess(newProfile, pendingUsernameLower, prefillJoinCode);
     } catch (e: any) {
-      onError('Benutzer konnte nicht gespeichert werden.');
+      onError('Benutzer konnte nicht gespeichert werden: ' + (e?.message || ''));
     } finally {
       setIsLoading(false);
     }
