@@ -99,7 +99,11 @@ export function initWindowStoragePolyfill() {
       },
 
       async set(key: string, value: string, _shared = true): Promise<void> {
-        setLocalFallback(key, value);
+        // The server store is the single source of truth. We only mirror to
+        // localStorage AFTER the server confirms the write, so the local cache
+        // can never diverge from the database. If the server write fails we
+        // surface the error (instead of silently keeping a local-only copy)
+        // so the caller knows the data did NOT persist and can retry.
         try {
           const res = await fetch('/api/storage/set', {
             method: 'POST',
@@ -107,11 +111,13 @@ export function initWindowStoragePolyfill() {
             body: JSON.stringify({ key, value }),
           });
           if (!res.ok) {
-            console.warn(`Server returned status ${res.status} for key:`, key);
+            throw new Error(`Server returned status ${res.status} for key: ${key}`);
           }
         } catch (err: any) {
-          console.warn('Network sync warning for set:', key, err);
+          throw new Error(err?.message || `Konnte "${key}" nicht in der Datenbank speichern.`);
         }
+        // Confirmed persisted -> update supporting read cache.
+        setLocalFallback(key, value);
       },
 
       async list(prefix = '', _shared = true): Promise<string[]> {

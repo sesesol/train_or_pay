@@ -85,6 +85,7 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
       const penaltyCents = Math.round(penaltyEuro * 100);
       const newMember: SessionMember = {
         user: usernameLower,
+        userId: currentUser.id,
         displayName: currentUser.displayName,
         joinedAt: new Date().toISOString(),
         penaltyCents,
@@ -140,9 +141,17 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
       // Check if already a member
       const existingMember = session.members.find((m) => m.user.toLowerCase() === usernameLower);
       if (existingMember) {
-        // Re-activate if was inactive
+        // Re-activate if was inactive and/or backfill the permanent user id.
+        let changed = false;
         if (!existingMember.active) {
           existingMember.active = true;
+          changed = true;
+        }
+        if (!existingMember.userId && currentUser.id) {
+          existingMember.userId = currentUser.id;
+          changed = true;
+        }
+        if (changed) {
           await storageSet(`session:${cleanCode}:meta`, session);
         }
         onSelectSession(session);
@@ -161,6 +170,7 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
       const penaltyCents = Math.round(penaltyEuro * 100);
       const newMember: SessionMember = {
         user: usernameLower,
+        userId: currentUser.id,
         displayName: currentUser.displayName,
         joinedAt: new Date().toISOString(),
         penaltyCents,
