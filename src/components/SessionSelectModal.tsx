@@ -8,7 +8,7 @@ import { Plus, LogIn, Users, Shield, ArrowRight, AlertTriangle, Sparkles, Check 
 import { SessionMeta, SessionMember, UserProfile } from '../types.ts';
 import { storageGet, storageSet } from '../lib/storage.ts';
 import { formatEuro } from '../lib/settlement.ts';
-import { getBerlinParts } from '../lib/time.ts';
+import { getBerlinParts, getBerlinISOWeek } from '../lib/time.ts';
 
 interface SessionSelectModalProps {
   currentUser: UserProfile;
@@ -174,6 +174,20 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
       };
 
       await storageSet(`session:${cleanCode}:meta`, updatedSession);
+
+      // Section 5.2/11: joining mid-week (Tue-Sun) means no participation in the
+      // running week -> explicitly persist goal 0 / no penalty / no payout, rather
+      // than relying on a fallback default that could drift out of sync later.
+      if (isMidWeek) {
+        const joinWeekKey = getBerlinISOWeek(new Date());
+        await storageSet(`session:${cleanCode}:week:${joinWeekKey}:user:${usernameLower}`, {
+          goal: 0,
+          checks: [],
+          penaltyCentsSnapshot: penaltyCents,
+          joinedMidWeek: true,
+          lockedAt: new Date().toISOString(),
+        });
+      }
 
       // Add to user profile sessions
       const updatedUserSessions = Array.from(new Set([...(currentUser.sessions || []), cleanCode]));

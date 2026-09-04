@@ -59,7 +59,7 @@ export default function App() {
   const nextWeekKey = getNextBerlinISOWeek(new Date());
 
   const [myCurrentWeekData, setMyCurrentWeekData] = useState<UserWeekData>({
-    goal: 3,
+    goal: 0,
     checks: [],
     penaltyCentsSnapshot: 500,
   });
@@ -241,9 +241,10 @@ export default function App() {
           if (mData) {
             membersMap[mLower] = mData;
           } else {
-            // Default initialized week data
+            // No goal set yet for this week -> spec 6.1/11: never defaults to a
+            // nonzero value, always 0 ("pausiert") until the member explicitly plans.
             membersMap[mLower] = {
-              goal: 3, // default target
+              goal: 0,
               checks: [],
               penaltyCentsSnapshot: member.penaltyCents,
             };
@@ -253,7 +254,7 @@ export default function App() {
 
         // Set my current week data
         const myData = membersMap[userLower] || {
-          goal: 3,
+          goal: 0,
           checks: [],
           penaltyCentsSnapshot:
             freshSession.members.find((m) => m.user.toLowerCase() === userLower)?.penaltyCents || 500,
@@ -494,7 +495,7 @@ export default function App() {
       memberInputs.push({
         user: mLower,
         displayName: member.displayName,
-        goal: uData ? uData.goal : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.goal ?? 3) : 0),
+        goal: uData ? uData.goal : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.goal ?? 0) : 0),
         completed: uData ? (uData.checks?.length || 0) : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.checks?.length || 0) : 0),
         penaltyCents: uData?.penaltyCentsSnapshot || member.penaltyCents,
         joinedMidWeek: uData?.joinedMidWeek || false,
