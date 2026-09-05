@@ -31,6 +31,7 @@ export interface MemberWeekInput {
   completed: number;
   penaltyCents: number;
   joinedMidWeek?: boolean;
+  excused?: number; // number of approved exception ("Entschuldigt") units this week
 }
 
 /**
@@ -44,9 +45,15 @@ export function calculateWeekSettlement(
     // If goal is 0 or joined mid-week with paused status
     const effectiveGoal = m.joinedMidWeek ? 0 : Math.max(0, m.goal);
     const completed = Math.min(m.completed, effectiveGoal); // only up to goal counts
-    const missed = Math.max(0, effectiveGoal - completed);
+    // Approved exceptions excuse open units: they count as neither done nor
+    // missed, so they never trigger a penalty. Capped at the remaining open
+    // units so they can never make "missed" negative or affect receiver status.
+    const excused = Math.min(Math.max(0, m.excused || 0), Math.max(0, effectiveGoal - completed));
+    const missed = Math.max(0, effectiveGoal - completed - excused);
     const penaltyRate = m.penaltyCents;
     const debtCents = missed * penaltyRate;
+    // Being a receiver still requires actually reaching the goal by training;
+    // an excused week neither pays nor receives.
     const isReceiver = effectiveGoal > 0 && m.completed >= effectiveGoal;
 
     return {
@@ -55,6 +62,7 @@ export function calculateWeekSettlement(
       completed: m.completed,
       penaltyCents: penaltyRate,
       missed,
+      excused,
       debtCents,
       isReceiver,
     };

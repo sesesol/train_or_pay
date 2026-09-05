@@ -21,6 +21,11 @@ import {
   ShieldCheck,
   Lock,
   Edit3,
+  CalendarX,
+  ThumbsUp,
+  ThumbsDown,
+  Send,
+  X,
 } from 'lucide-react';
 import {
   SessionMeta,
@@ -28,7 +33,9 @@ import {
   SessionMember,
   UserProfile,
   WorkoutCheck,
+  ExceptionRequest,
 } from '../types.ts';
+import { EXCEPTION_REASONS, statusLabel } from '../lib/exceptions.ts';
 import {
   getBerlinParts,
   getWeekDateRange,
@@ -53,7 +60,11 @@ interface ThisWeekViewProps {
   myCurrentWeekData: UserWeekData;
   myNextWeekData: UserWeekData | null;
   allMembersCurrentWeek: Record<string, UserWeekData>;
+  weekExceptions: ExceptionRequest[];
+  excusedByUser: Record<string, number>;
   onUpdateMyWeekData: (weekKey: string, updated: UserWeekData) => Promise<void>;
+  onRequestException: (reasonCode?: string, reasonLabel?: string) => Promise<void> | void;
+  onDecideException: (request: ExceptionRequest, approve: boolean) => Promise<void> | void;
   onError: (msg: string) => void;
   onSuccess: (msg: string) => void;
 }
@@ -67,7 +78,11 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
   myCurrentWeekData,
   myNextWeekData,
   allMembersCurrentWeek,
+  weekExceptions,
+  excusedByUser,
   onUpdateMyWeekData,
+  onRequestException,
+  onDecideException,
   onError,
   onSuccess,
 }) => {
@@ -92,8 +107,51 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
 
   const currentGoal = myCurrentWeekData.goal;
   const checksCount = myCurrentWeekData.checks.length;
-  const missedUnits = Math.max(0, currentGoal - checksCount);
+
+  // Excused units (approved exceptions) count as neither done nor missed.
+  const myApprovedExcused = excusedByUser[usernameLower] || 0;
+  const excusedForRender = Math.min(myApprovedExcused, Math.max(0, currentGoal - checksCount));
+  const missedUnits = Math.max(0, currentGoal - checksCount - excusedForRender);
   const potentialPenalty = missedUnits * (myCurrentWeekData.penaltyCentsSnapshot || currentPenaltyCents);
+
+  // Exception ("Ausnahme") derivations for the current user & partner.
+  const myRequests = weekExceptions.filter((e) => e.requester.toLowerCase() === usernameLower);
+  const myPendingRequests = myRequests.filter((e) => e.status === 'pending');
+  const myActiveExceptionCount = myRequests.filter(
+    (e) => e.status === 'pending' || e.status === 'approved'
+  ).length;
+  // Requests from partners that are still waiting for MY decision.
+  const incomingPending = weekExceptions.filter(
+    (e) => e.status === 'pending' && e.requester.toLowerCase() !== usernameLower
+  );
+  const hasOtherActiveMember = session.members.some(
+    (m) => m.active && m.user.toLowerCase() !== usernameLower
+  );
+  const openForRequest = currentGoal - checksCount - myActiveExceptionCount;
+  const canRequestException = currentGoal > 0 && openForRequest > 0 && hasOtherActiveMember;
+
+  // Inline reason picker state for requesting an exception.
+  const [showReasonPicker, setShowReasonPicker] = useState<boolean>(false);
+  const [selectedReason, setSelectedReason] = useState<string>('krank');
+  const [customReason, setCustomReason] = useState<string>('');
+  const [isSubmittingException, setIsSubmittingException] = useState<boolean>(false);
+
+  const submitException = async () => {
+    const opt = EXCEPTION_REASONS.find((r) => r.code === selectedReason);
+    const label =
+      selectedReason === 'anderer' && customReason.trim()
+        ? customReason.trim().slice(0, 80)
+        : opt?.label;
+    setIsSubmittingException(true);
+    try {
+      await onRequestException(selectedReason, label);
+      setShowReasonPicker(false);
+      setCustomReason('');
+      setSelectedReason('krank');
+    } finally {
+      setIsSubmittingException(false);
+    }
+  };
 
   // Unreachable goal warning (Section 12)
   // If not allowMultiplePerDay, max 1 check per day.
@@ -105,59 +163,41 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
     isSameBerlinDay(new Date(c.timestamp), now)
   );
 
-  const handleToggleCircle = async (circleIndex: number) => {
-    // Check if week is locked (e.g. past week)
+  const removeCheckAt = async (checkIndex: number) => {
     if (myCurrentWeekData.lockedAt) {
       onError('Diese Woche ist abgeschlossen und kann nicht mehr geändert werden.');
       return;
     }
-
     const currentChecks = [...myCurrentWeekData.checks];
+    if (checkIndex < 0 || checkIndex >= currentChecks.length) return;
+    currentChecks.splice(checkIndex, 1);
+    await onUpdateMyWeekData(currentWeekKey, { ...myCurrentWeekData, checks: currentChecks });
+    onSuccess('Einheit zurückgenommen.');
+  };
 
-    if (circleIndex < currentChecks.length) {
-      // Removing the checkmark (undo)
-      currentChecks.splice(circleIndex, 1);
-      const updated: UserWeekData = {
-        ...myCurrentWeekData,
-        checks: currentChecks,
-      };
-      await onUpdateMyWeekData(currentWeekKey, updated);
-      onSuccess('Einheit zurückgenommen.');
-    } else if (circleIndex === currentChecks.length) {
-      // Adding new checkmark
-      if (!allowMultiple && hasCheckedInToday) {
-        onError('Für heute bereits eingetragen. (Maximal eine Einheit pro Tag)');
-        return;
-      }
+  const addCheck = async () => {
+    if (myCurrentWeekData.lockedAt) {
+      onError('Diese Woche ist abgeschlossen und kann nicht mehr geändert werden.');
+      return;
+    }
+    if (!allowMultiple && hasCheckedInToday) {
+      onError('Für heute bereits eingetragen. (Maximal eine Einheit pro Tag)');
+      return;
+    }
+    // Done + excused units may not exceed the weekly goal.
+    if (checksCount + excusedForRender >= currentGoal) {
+      onError('Du hast dein Trainingsziel für diese Woche bereits erreicht!');
+      return;
+    }
 
-      if (currentChecks.length >= currentGoal) {
-        onError('Du hast dein Trainingsziel für diese Woche bereits erreicht!');
-        return;
-      }
+    const currentChecks = [...myCurrentWeekData.checks, { timestamp: new Date().toISOString() } as WorkoutCheck];
+    await onUpdateMyWeekData(currentWeekKey, { ...myCurrentWeekData, checks: currentChecks });
 
-      const newCheck: WorkoutCheck = {
-        timestamp: new Date().toISOString(),
-      };
-      currentChecks.push(newCheck);
-
-      const updated: UserWeekData = {
-        ...myCurrentWeekData,
-        checks: currentChecks,
-      };
-
-      await onUpdateMyWeekData(currentWeekKey, updated);
-
-      // Trigger celebration confetti if goal reached
-      if (currentChecks.length === currentGoal && currentGoal > 0) {
-        confetti({
-          particleCount: 80,
-          spread: 70,
-          origin: { y: 0.6 },
-        });
-        onSuccess('Glückwunsch! Ziel für diese Woche erreicht! 🎉');
-      } else {
-        onSuccess('Einheit abgehakt! Stark gemacht! 💪');
-      }
+    if (currentChecks.length + excusedForRender >= currentGoal && currentGoal > 0) {
+      confetti({ particleCount: 80, spread: 70, origin: { y: 0.6 } });
+      onSuccess('Glückwunsch! Ziel für diese Woche erreicht! 🎉');
+    } else {
+      onSuccess('Einheit abgehakt! Stark gemacht! 💪');
     }
   };
 
@@ -259,19 +299,32 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
             <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-6 py-4">
               {Array.from({ length: currentGoal }).map((_, idx) => {
                 const isChecked = idx < checksCount;
-                const isNextToCheck = idx === checksCount;
+                const isExcused = idx >= checksCount && idx < checksCount + excusedForRender;
+                const firstOpenIdx = checksCount + excusedForRender;
+                const isNextToCheck = idx === firstOpenIdx;
                 const checkData = isChecked ? myCurrentWeekData.checks[idx] : null;
+
+                const handleClick = () => {
+                  if (isChecked) removeCheckAt(idx);
+                  else if (isExcused)
+                    onError('Dieser Sporttag ist entschuldigt (genehmigte Ausnahme).');
+                  else if (isNextToCheck) addCheck();
+                };
 
                 return (
                   <button
                     key={idx}
                     type="button"
                     id={`workout-circle-${idx}`}
-                    aria-label={`Einheit ${idx + 1} von ${currentGoal}, ${isChecked ? 'erledigt' : 'nicht erledigt'}`}
-                    onClick={() => handleToggleCircle(idx)}
+                    aria-label={`Einheit ${idx + 1} von ${currentGoal}, ${
+                      isChecked ? 'erledigt' : isExcused ? 'entschuldigt' : 'nicht erledigt'
+                    }`}
+                    onClick={handleClick}
                     className={`relative w-20 h-20 sm:w-22 sm:h-22 rounded-full flex flex-col items-center justify-center transition-all cursor-pointer select-none active:scale-95 ${
                       isChecked
                         ? 'border-4 border-[#DFFF00] bg-[#DFFF00] text-black shadow-lg shadow-[#DFFF00]/20'
+                        : isExcused
+                        ? 'border-4 border-amber-400 bg-amber-400/90 text-black shadow-lg shadow-amber-400/20 cursor-default'
                         : isNextToCheck
                         ? 'border-4 border-dashed border-[#DFFF00]/70 bg-white/5 hover:border-[#DFFF00] hover:bg-[#DFFF00]/10 text-white'
                         : 'border-4 border-dashed border-white/20 bg-white/5 text-white/30'
@@ -279,6 +332,8 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                   >
                     {isChecked ? (
                       <Check className="w-10 h-10 stroke-[3.5] text-black animate-in zoom-in-75 duration-200" />
+                    ) : isExcused ? (
+                      <CalendarX className="w-8 h-8 stroke-[2.5] text-black animate-in zoom-in-75 duration-200" />
                     ) : (
                       <span className="text-lg font-black font-mono">{idx + 1}</span>
                     )}
@@ -286,6 +341,11 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                     {isChecked && checkData && (
                       <span className="text-[9px] font-black font-mono text-black/80 -mt-1 tracking-tight">
                         {formatBerlinDate(checkData.timestamp)}
+                      </span>
+                    )}
+                    {isExcused && (
+                      <span className="text-[8px] font-black font-mono text-black/80 -mt-0.5 tracking-tight uppercase">
+                        Entschuldigt
                       </span>
                     )}
                   </button>
@@ -322,7 +382,137 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
             Laufende Woche fixiert
           </span>
         </div>
+
+        {/* EXCEPTION ("Ausnahme") — request to skip one planned unit this week */}
+        {currentGoal > 0 && (
+          <div className="relative z-10 pt-3 border-t border-white/10 flex flex-col gap-3">
+            {/* Status of my own pending requests */}
+            {myPendingRequests.map((req) => (
+              <div
+                key={req.id}
+                className="p-3 bg-amber-400/10 border border-amber-400/30 rounded-2xl text-xs text-amber-200 flex items-start gap-2.5"
+              >
+                <Clock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <p className="leading-relaxed">
+                  <strong className="text-amber-300">Ausnahme angefragt{req.reasonLabel ? ` (${req.reasonLabel})` : ''}.</strong>{' '}
+                  Wartet auf Zustimmung deines Partners.
+                </p>
+              </div>
+            ))}
+
+            {!showReasonPicker ? (
+              canRequestException && (
+                <button
+                  type="button"
+                  id="request-exception-btn"
+                  onClick={() => setShowReasonPicker(true)}
+                  className="w-full min-h-[44px] py-2.5 px-4 bg-white/5 hover:bg-amber-400/10 border border-amber-400/30 hover:border-amber-400/60 text-amber-200 font-black uppercase tracking-wider rounded-2xl text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <CalendarX className="w-4 h-4" />
+                  Sporttag ausnahmsweise auslassen
+                </button>
+              )
+            ) : (
+              <div className="p-4 bg-black/40 border border-amber-400/30 rounded-2xl flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-black uppercase tracking-wider text-amber-200">Grund (optional)</span>
+                  <button
+                    type="button"
+                    onClick={() => setShowReasonPicker(false)}
+                    className="text-white/40 hover:text-white cursor-pointer"
+                    aria-label="Abbrechen"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {EXCEPTION_REASONS.map((r) => (
+                    <button
+                      key={r.code}
+                      type="button"
+                      onClick={() => setSelectedReason(r.code)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all cursor-pointer ${
+                        selectedReason === r.code
+                          ? 'bg-amber-400 text-black shadow-md'
+                          : 'bg-white/10 hover:bg-white/20 text-white/80'
+                      }`}
+                    >
+                      {r.label}
+                    </button>
+                  ))}
+                </div>
+                {selectedReason === 'anderer' && (
+                  <input
+                    type="text"
+                    value={customReason}
+                    maxLength={80}
+                    onChange={(e) => setCustomReason(e.target.value)}
+                    placeholder="Kurze Begründung (optional)"
+                    className="w-full px-3 py-2.5 bg-black/50 border border-white/15 rounded-xl text-sm text-white placeholder-white/30 focus:outline-hidden focus:border-amber-400"
+                  />
+                )}
+                <p className="text-[11px] text-white/50 leading-relaxed">
+                  Deine Anfrage wird an die Gruppe gesendet und muss von einem anderen Mitglied bestätigt werden. Zukünftige Wochen bleiben unverändert.
+                </p>
+                <button
+                  type="button"
+                  id="submit-exception-btn"
+                  disabled={isSubmittingException}
+                  onClick={submitException}
+                  className="w-full min-h-[44px] py-2.5 px-4 bg-amber-400 hover:scale-[1.02] active:scale-95 text-black font-black uppercase tracking-wider rounded-2xl text-xs transition-all disabled:opacity-40 flex items-center justify-center gap-2 cursor-pointer shadow-lg"
+                >
+                  <Send className="w-4 h-4" />
+                  {isSubmittingException ? 'Sende...' : 'Ausnahme-Anfrage senden'}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* INCOMING EXCEPTION REQUESTS awaiting my decision */}
+      {incomingPending.length > 0 && (
+        <div id="incoming-exceptions-card" className="flex flex-col gap-3">
+          {incomingPending.map((req) => (
+            <div
+              key={req.id}
+              className="bg-amber-400/10 border-2 border-amber-400/40 rounded-3xl p-5 shadow-xl flex flex-col gap-4"
+            >
+              <div className="flex items-start gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-amber-400 text-black flex items-center justify-center shrink-0">
+                  <CalendarX className="w-5 h-5 stroke-[2.5]" />
+                </div>
+                <div className="flex flex-col min-w-0">
+                  <h3 className="text-sm font-black uppercase tracking-tight text-white">Ausnahme-Anfrage</h3>
+                  <p className="text-xs text-white/70 leading-relaxed mt-0.5">
+                    <strong className="text-amber-200">{req.requesterDisplayName}</strong> möchte einen geplanten Sporttag diese Woche ausnahmsweise auslassen{req.reasonLabel ? <> — Grund: <strong className="text-white">{req.reasonLabel}</strong></> : ''}.
+                  </p>
+                </div>
+              </div>
+              <div className="flex gap-2.5">
+                <button
+                  type="button"
+                  id={`approve-exception-${req.id}`}
+                  onClick={() => onDecideException(req, true)}
+                  className="flex-1 min-h-[46px] py-2.5 px-4 bg-[#DFFF00] hover:scale-[1.02] active:scale-95 text-black font-black uppercase tracking-wider rounded-2xl text-xs transition-all flex items-center justify-center gap-2 cursor-pointer shadow-lg"
+                >
+                  <ThumbsUp className="w-4 h-4" />
+                  Zustimmen
+                </button>
+                <button
+                  type="button"
+                  id={`reject-exception-${req.id}`}
+                  onClick={() => onDecideException(req, false)}
+                  className="flex-1 min-h-[46px] py-2.5 px-4 bg-white/10 hover:bg-white/20 text-white font-black uppercase tracking-wider rounded-2xl text-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <ThumbsDown className="w-4 h-4" />
+                  Ablehnen
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* PROMINENT NEXT WEEK PLANNING & EDITING CARD */}
       <div
@@ -457,7 +647,13 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
 
               const completed = memberData.checks?.length || 0;
               const goal = memberData.goal;
+              const memberExcused = Math.min(excusedByUser[memberLower] || 0, Math.max(0, goal - completed));
               const isSuccess = goal > 0 && completed >= goal;
+              // Sorted check dates (what the partner actually did, and when).
+              const checkDates = (memberData.checks || [])
+                .map((c) => c.timestamp)
+                .sort()
+                .map((ts) => formatBerlinDate(ts));
 
               return (
                 <div
@@ -498,25 +694,47 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                         )}
                       </div>
                       <span className="text-xs text-white/50 font-mono mt-0.5">
-                        {goal === 0 ? 'Pausiert' : `${completed} / ${goal} Einheiten`} • {formatEuro(member.penaltyCents)}
+                        {goal === 0 ? 'Pausiert' : `${completed} / ${goal} Einheiten`}
+                        {memberExcused > 0 && <span className="text-amber-300"> • {memberExcused} entsch.</span>}
+                        {' '}• {formatEuro(member.penaltyCents)}
                       </span>
+                      {/* Dates the member actually trained (visible to the partner) */}
+                      {checkDates.length > 0 && (
+                        <div className="flex flex-wrap gap-1 mt-1.5">
+                          {checkDates.map((d, i) => (
+                            <span
+                              key={i}
+                              className="px-1.5 py-0.5 bg-[#DFFF00]/15 text-[#DFFF00] text-[9px] font-mono font-bold rounded-md flex items-center gap-0.5"
+                            >
+                              <Check className="w-2.5 h-2.5 stroke-[3]" />
+                              {d}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
 
-                  {/* Mini Circles Indicator */}
+                  {/* Mini Circles Indicator: done (lime) + excused (amber) + open */}
                   <div className="flex items-center gap-1.5 shrink-0">
                     {goal > 0 ? (
                       <div className="flex items-center gap-1">
-                        {Array.from({ length: Math.min(goal, 7) }).map((_, cIdx) => (
-                          <span
-                            key={cIdx}
-                            className={`w-4 h-4 rounded-full flex items-center justify-center text-[8px] ${
-                              cIdx < completed
-                                ? 'bg-[#DFFF00] text-black font-black'
-                                : 'bg-white/5 border border-white/20'
-                            }`}
-                          />
-                        ))}
+                        {Array.from({ length: Math.min(goal, 7) }).map((_, cIdx) => {
+                          const isDone = cIdx < completed;
+                          const isExc = !isDone && cIdx < completed + memberExcused;
+                          return (
+                            <span
+                              key={cIdx}
+                              className={`w-4 h-4 rounded-full flex items-center justify-center text-[8px] ${
+                                isDone
+                                  ? 'bg-[#DFFF00] text-black font-black'
+                                  : isExc
+                                  ? 'bg-amber-400 text-black font-black'
+                                  : 'bg-white/5 border border-white/20'
+                              }`}
+                            />
+                          );
+                        })}
                         {goal > 7 && <span className="text-[10px] font-mono text-white/40">+{goal - 7}</span>}
                       </div>
                     ) : (
@@ -527,6 +745,47 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
               );
             })}
         </div>
+
+        {/* Legend + full transparency list of this week's exceptions */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-[10px] font-bold uppercase tracking-wider text-white/50 px-1">
+          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-[#DFFF00]" /> Erledigt</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-amber-400" /> Entschuldigt</span>
+          <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-full bg-white/10 border border-white/25" /> Offen / Verpasst</span>
+        </div>
+
+        {weekExceptions.length > 0 && (
+          <div className="flex flex-col gap-2 mt-1">
+            <h4 className="text-[10px] uppercase tracking-[0.2em] text-white/40 font-bold flex items-center gap-2">
+              <CalendarX className="w-3.5 h-3.5 text-amber-400" />
+              Ausnahmen diese Woche
+            </h4>
+            {weekExceptions
+              .slice()
+              .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+              .map((req) => {
+                const badge =
+                  req.status === 'approved'
+                    ? 'bg-amber-400/20 text-amber-300 border-amber-400/30'
+                    : req.status === 'rejected'
+                    ? 'bg-red-500/10 text-red-300 border-red-500/30'
+                    : 'bg-white/10 text-white/70 border-white/20';
+                return (
+                  <div
+                    key={req.id}
+                    className="flex items-center justify-between gap-2 p-2.5 bg-white/5 border border-white/10 rounded-xl text-xs"
+                  >
+                    <span className="text-white/80 min-w-0 truncate">
+                      <strong className="text-white">{req.requesterDisplayName}</strong>
+                      {req.reasonLabel ? <span className="text-white/50"> — {req.reasonLabel}</span> : ''}
+                    </span>
+                    <span className={`px-2 py-0.5 rounded-md border font-black uppercase tracking-wider text-[9px] shrink-0 ${badge}`}>
+                      {statusLabel(req.status)}
+                    </span>
+                  </div>
+                );
+              })}
+          </div>
+        )}
       </div>
     </div>
   );

@@ -27,6 +27,7 @@ interface NavbarProps {
   isRefreshing: boolean;
   onSwitchSession: () => void;
   openDebtsCount: number;
+  weekBadgeCount?: number; // pending exception requests awaiting my decision
 }
 
 export const TopNavbar: React.FC<NavbarProps> = ({
@@ -96,9 +97,10 @@ export const BottomNavbar: React.FC<NavbarProps> = ({
   currentTab,
   onSelectTab,
   openDebtsCount,
+  weekBadgeCount = 0,
 }) => {
   const tabs = [
-    { id: 'week' as const, label: 'Diese Woche', icon: Calendar },
+    { id: 'week' as const, label: 'Diese Woche', icon: Calendar, badge: weekBadgeCount > 0 ? weekBadgeCount : null },
     { id: 'debts' as const, label: 'Schulden', icon: DollarSign, badge: openDebtsCount > 0 ? openDebtsCount : null },
     { id: 'history' as const, label: 'Verlauf', icon: History },
     { id: 'settings' as const, label: 'Session', icon: Settings },
