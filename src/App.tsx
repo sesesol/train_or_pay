@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   UserProfile,
   SessionMeta,
@@ -11,6 +11,7 @@ import {
   WeekSettlement,
   DebtItem,
   DebtsStorage,
+  ExceptionRequest,
 } from './types.ts';
 import {
   storageGet,
@@ -25,6 +26,13 @@ import {
   readLoginSession,
   clearLoginSession,
 } from './lib/session.ts';
+import {
+  loadWeekExceptions,
+  excusedByUser,
+  countActiveExceptions,
+  nextSlotForUser,
+  exceptionKey,
+} from './lib/exceptions.ts';
 import {
   getBerlinISOWeek,
   getNextBerlinISOWeek,
@@ -121,6 +129,14 @@ export default function App() {
   });
   const [myNextWeekData, setMyNextWeekData] = useState<UserWeekData | null>(null);
   const [allMembersCurrentWeek, setAllMembersCurrentWeek] = useState<Record<string, UserWeekData>>({});
+
+  // Exception ("Ausnahme") requests for the current week of the active session
+  const [weekExceptions, setWeekExceptions] = useState<ExceptionRequest[]>([]);
+
+  // Refs used for reliable auto-sync without clobbering in-flight local edits.
+  const refreshRef = useRef<((s: SessionMeta, u: string, silent?: boolean) => Promise<void>) | null>(null);
+  const pendingMyWriteRef = useRef<number>(0);
+  const myWeekDataRef = useRef<UserWeekData | null>(null);
 
   // Debts & Settlements
   const [openDebts, setOpenDebts] = useState<DebtItem[]>([]);
@@ -230,6 +246,10 @@ export default function App() {
           continue;
         }
 
+        // Approved exceptions for that past week -> excused (penalty-free) units.
+        const pastExceptions = await loadWeekExceptions(code, pastWeek);
+        const pastExcused = excusedByUser(pastExceptions);
+
         // Freshly load all member week data for that past week
         const memberInputs = [];
         for (const member of session.members) {
@@ -244,6 +264,7 @@ export default function App() {
             completed: uData ? uData.checks?.length || 0 : 0,
             penaltyCents: uData?.penaltyCentsSnapshot || member.penaltyCents,
             joinedMidWeek: uData?.joinedMidWeek || false,
+            excused: pastExcused[mLower] || 0,
           });
         }
 
@@ -274,10 +295,12 @@ export default function App() {
     [currentWeekKey]
   );
 
-  // Freshly load all data for the active session (Section 2.3)
+  // Freshly load all data for the active session (Section 2.3).
+  // `silent` is used by background auto-sync so it doesn't flash the spinner or
+  // raise error toasts on transient network blips.
   const refreshSessionData = useCallback(
-    async (session: SessionMeta, userLower: string) => {
-      setIsRefreshing(true);
+    async (session: SessionMeta, userLower: string, silent = false) => {
+      if (!silent) setIsRefreshing(true);
       const code = session.code;
 
       try {
@@ -307,6 +330,14 @@ export default function App() {
             };
           }
         }
+
+        // If the current user has a write in flight (e.g. just tapped a circle),
+        // keep the local copy of THEIR data so a concurrent auto-sync refresh can
+        // never roll back their own edit. Other members' data is always taken
+        // fresh from the database.
+        if (pendingMyWriteRef.current > 0 && myWeekDataRef.current) {
+          membersMap[userLower] = myWeekDataRef.current;
+        }
         setAllMembersCurrentWeek(membersMap);
 
         // Set my current week data
@@ -317,6 +348,11 @@ export default function App() {
             freshSession.members.find((m) => m.user.toLowerCase() === userLower)?.penaltyCents || 500,
         };
         setMyCurrentWeekData(myData);
+        myWeekDataRef.current = myData;
+
+        // 3b. Load shared exception requests for the current week (both partners).
+        const exceptions = await loadWeekExceptions(code, currentWeekKey);
+        setWeekExceptions(exceptions);
 
         // 4. Read my next week data if planned
         const nextWeekDataKey = `session:${code}:week:${nextWeekKey}:user:${userLower}`;
@@ -339,17 +375,49 @@ export default function App() {
         }
         setSettlements(loadedSettlements);
       } catch (err: any) {
-        addToast(
-          'error',
-          'Konnte Session-Daten nicht vollständig laden.',
-          () => refreshSessionData(session, userLower)
-        );
+        if (!silent) {
+          addToast(
+            'error',
+            'Konnte Session-Daten nicht vollständig laden.',
+            () => refreshSessionData(session, userLower)
+          );
+        }
       } finally {
-        setIsRefreshing(false);
+        if (!silent) setIsRefreshing(false);
       }
     },
     [currentWeekKey, nextWeekKey, checkAndRunPastSettlements]
   );
+
+  // Keep a ref to the latest refresh fn so background auto-sync always calls the
+  // current version without needing it in the polling effect's dependencies.
+  useEffect(() => {
+    refreshRef.current = refreshSessionData;
+  });
+
+  // Auto-sync: because this key-value backend has no realtime push, poll the
+  // shared session on an interval and whenever the tab regains focus, so each
+  // partner reliably sees the other's latest checks and exception decisions.
+  useEffect(() => {
+    if (!currentSession || !usernameLower) return;
+    const doSync = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      const fn = refreshRef.current;
+      if (fn) fn(currentSession, usernameLower, true).catch(() => {});
+    };
+    const interval = window.setInterval(doSync, 15000);
+    const onVisibility = () => {
+      if (typeof document !== 'undefined' && !document.hidden) doSync();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', doSync);
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', doSync);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSession?.code, usernameLower]);
 
   // Login handler
   const handleLoginSuccess = async (
@@ -411,23 +479,148 @@ export default function App() {
     if (!currentSession || !usernameLower) return;
     const storageKey = `session:${currentSession.code}:week:${weekKey}:user:${usernameLower}`;
 
+    // Optimistically reflect the edit and mark a write in flight so a concurrent
+    // auto-sync refresh keeps this local copy instead of rolling it back.
+    if (weekKey === currentWeekKey) {
+      myWeekDataRef.current = updated;
+      setMyCurrentWeekData(updated);
+      setAllMembersCurrentWeek((prev) => ({ ...prev, [usernameLower]: updated }));
+    } else if (weekKey === nextWeekKey) {
+      setMyNextWeekData(updated);
+    }
+
+    pendingMyWriteRef.current += 1;
     try {
       await storageSet(storageKey, updated);
-
-      if (weekKey === currentWeekKey) {
-        setMyCurrentWeekData(updated);
-        setAllMembersCurrentWeek((prev) => ({
-          ...prev,
-          [usernameLower]: updated,
-        }));
-      } else if (weekKey === nextWeekKey) {
-        setMyNextWeekData(updated);
-      }
     } catch (err: any) {
       addToast('error', 'Konnte nicht gespeichert werden, bitte erneut versuchen.', () =>
         handleUpdateMyWeekData(weekKey, updated)
       );
       throw err;
+    } finally {
+      pendingMyWriteRef.current = Math.max(0, pendingMyWriteRef.current - 1);
+    }
+  };
+
+  // Request an exception ("Ausnahme") for one open planned unit of the current
+  // week. Needs a partner's approval; never affects future weeks.
+  const handleRequestException = async (reasonCode?: string, reasonLabel?: string) => {
+    if (!currentSession || !usernameLower || !currentUser) return;
+    const code = currentSession.code;
+
+    // Permission: only an active member of THIS session may request.
+    const me = currentSession.members.find(
+      (m) => m.user.toLowerCase() === usernameLower && m.active
+    );
+    if (!me) {
+      addToast('error', 'Nur aktive Mitglieder dieser Gruppe können eine Ausnahme beantragen.');
+      return;
+    }
+
+    const myData = allMembersCurrentWeek[usernameLower] || myCurrentWeekData;
+    const goal = myData?.goal || 0;
+    const completed = myData?.checks?.length || 0;
+    if (goal <= 0) {
+      addToast('info', 'Diese Woche ist pausiert – es gibt keinen Sporttag zum Auslassen.');
+      return;
+    }
+
+    // There must be another active member who can decide (no self-approval).
+    const otherActive = currentSession.members.filter(
+      (m) => m.active && m.user.toLowerCase() !== usernameLower
+    );
+    if (otherActive.length === 0) {
+      addToast('error', 'Es gibt kein anderes Mitglied, das die Ausnahme genehmigen könnte.');
+      return;
+    }
+
+    try {
+      // Re-read fresh to avoid races and prevent more requests than open units.
+      const fresh = await loadWeekExceptions(code, currentWeekKey);
+      const active = countActiveExceptions(fresh, usernameLower);
+      const open = goal - completed - active;
+      if (open <= 0) {
+        addToast('info', 'Für diese Woche sind keine offenen Sporttage mehr zum Auslassen vorhanden.');
+        await refreshSessionData(currentSession, usernameLower);
+        return;
+      }
+
+      const slot = nextSlotForUser(fresh, usernameLower);
+      const req: ExceptionRequest = {
+        id: `${currentWeekKey}:${usernameLower}:${slot}`,
+        sessionCode: code,
+        weekKey: currentWeekKey,
+        requester: usernameLower,
+        requesterId: currentUser.id,
+        requesterDisplayName: currentUser.displayName,
+        slot,
+        reasonCode,
+        reasonLabel,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      };
+      await storageSet(exceptionKey(code, currentWeekKey, usernameLower, slot), req);
+      addToast('success', 'Ausnahme-Anfrage gesendet. Sie wartet auf die Zustimmung deines Partners.');
+      await refreshSessionData(currentSession, usernameLower);
+    } catch (e: any) {
+      addToast('error', 'Ausnahme-Anfrage konnte nicht gespeichert werden: ' + (e?.message || ''));
+    }
+  };
+
+  // Approve or reject an exception request. Only a partner (not the requester)
+  // of the same session may decide, and only while it is still pending.
+  const handleDecideException = async (request: ExceptionRequest, approve: boolean) => {
+    if (!currentSession || !usernameLower || !currentUser) return;
+    const code = currentSession.code;
+
+    const me = currentSession.members.find(
+      (m) => m.user.toLowerCase() === usernameLower && m.active
+    );
+    if (!me) {
+      addToast('error', 'Nur aktive Mitglieder dieser Gruppe können entscheiden.');
+      return;
+    }
+    if (request.sessionCode !== code) {
+      addToast('error', 'Diese Anfrage gehört nicht zu dieser Gruppe.');
+      return;
+    }
+    if (request.requester.toLowerCase() === usernameLower) {
+      addToast('error', 'Du kannst deine eigene Anfrage nicht selbst bestätigen.');
+      return;
+    }
+
+    try {
+      // Re-read the specific request to avoid acting on stale state / double-decide.
+      const key = exceptionKey(code, request.weekKey, request.requester.toLowerCase(), request.slot);
+      const freshReq = await storageGet<ExceptionRequest>(key);
+      if (!freshReq) {
+        addToast('error', 'Diese Anfrage ist nicht mehr vorhanden.');
+        await refreshSessionData(currentSession, usernameLower);
+        return;
+      }
+      if (freshReq.status !== 'pending') {
+        addToast('info', 'Diese Anfrage wurde bereits entschieden.');
+        await refreshSessionData(currentSession, usernameLower);
+        return;
+      }
+
+      const updated: ExceptionRequest = {
+        ...freshReq,
+        status: approve ? 'approved' : 'rejected',
+        decidedBy: usernameLower,
+        decidedByDisplayName: currentUser.displayName,
+        decidedAt: new Date().toISOString(),
+      };
+      await storageSet(key, updated);
+      addToast(
+        'success',
+        approve
+          ? `Ausnahme für ${freshReq.requesterDisplayName} genehmigt (Entschuldigt).`
+          : `Ausnahme für ${freshReq.requesterDisplayName} abgelehnt.`
+      );
+      await refreshSessionData(currentSession, usernameLower);
+    } catch (e: any) {
+      addToast('error', 'Entscheidung konnte nicht gespeichert werden: ' + (e?.message || ''));
     }
   };
 
@@ -556,6 +749,10 @@ export default function App() {
     const code = currentSession.code;
     const weekKey = targetWeekKey || currentWeekKey;
 
+    // Approved exceptions for this week -> excused (penalty-free) units.
+    const weekExc = await loadWeekExceptions(code, weekKey);
+    const weekExcused = excusedByUser(weekExc);
+
     // Load member week inputs
     const memberInputs = [];
     for (const member of currentSession.members) {
@@ -571,6 +768,7 @@ export default function App() {
         completed: uData ? (uData.checks?.length || 0) : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.checks?.length || 0) : 0),
         penaltyCents: uData?.penaltyCentsSnapshot || member.penaltyCents,
         joinedMidWeek: uData?.joinedMidWeek || false,
+        excused: weekExcused[mLower] || 0,
       });
     }
 
@@ -781,6 +979,12 @@ export default function App() {
     );
   }
 
+  // Derived: current-week excused counts per user + pending requests I must decide.
+  const currentWeekExcused = excusedByUser(weekExceptions);
+  const pendingExceptionsForMe = weekExceptions.filter(
+    (e) => e.status === 'pending' && e.requester.toLowerCase() !== usernameLower
+  ).length;
+
   return (
     <div className="min-h-screen bg-[#0A0A0A] text-white flex flex-col justify-between selection:bg-[#DFFF00] selection:text-black font-sans">
       {/* Top Navbar */}
@@ -794,6 +998,7 @@ export default function App() {
           isRefreshing={isRefreshing}
           onSwitchSession={() => setShowSessionModal(true)}
           openDebtsCount={openDebts.filter((d) => d.status !== 'paid').length}
+          weekBadgeCount={pendingExceptionsForMe}
         />
       )}
 
@@ -829,7 +1034,11 @@ export default function App() {
                 myCurrentWeekData={myCurrentWeekData}
                 myNextWeekData={myNextWeekData}
                 allMembersCurrentWeek={allMembersCurrentWeek}
+                weekExceptions={weekExceptions}
+                excusedByUser={currentWeekExcused}
                 onUpdateMyWeekData={handleUpdateMyWeekData}
+                onRequestException={handleRequestException}
+                onDecideException={handleDecideException}
                 onError={(msg) => addToast('error', msg)}
                 onSuccess={(msg) => addToast('success', msg)}
               />
@@ -844,6 +1053,7 @@ export default function App() {
                 paymentHistory={paymentHistory}
                 currentWeekKey={currentWeekKey}
                 allMembersCurrentWeek={allMembersCurrentWeek}
+                excusedByUser={currentWeekExcused}
                 onUpdateDebts={handleUpdateDebts}
                 onRunKassenabschluss={handleRunKassenabschluss}
                 onRecordDirectPayment={handleRecordDirectPayment}
@@ -892,6 +1102,7 @@ export default function App() {
           isRefreshing={isRefreshing}
           onSwitchSession={() => setShowSessionModal(true)}
           openDebtsCount={openDebts.filter((d) => d.status !== 'paid').length}
+          weekBadgeCount={pendingExceptionsForMe}
         />
       )}
 

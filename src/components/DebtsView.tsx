@@ -33,6 +33,7 @@ interface DebtsViewProps {
   paymentHistory: DebtItem[];
   currentWeekKey?: string;
   allMembersCurrentWeek?: Record<string, UserWeekData>;
+  excusedByUser?: Record<string, number>;
   onUpdateDebts: (updatedOpen: DebtItem[], updatedHistory: DebtItem[]) => Promise<void>;
   onRunKassenabschluss?: (weekKey?: string) => Promise<WeekSettlement>;
   onRecordDirectPayment?: (fromUser: string, toUser: string, amountCents: number, memo?: string) => Promise<void>;
@@ -48,6 +49,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
   paymentHistory,
   currentWeekKey = '2026-W12',
   allMembersCurrentWeek = {},
+  excusedByUser = {},
   onUpdateDebts,
   onRunKassenabschluss,
   onRecordDirectPayment,
@@ -89,6 +91,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
       completed: uData ? (uData.checks?.length || 0) : 0,
       penaltyCents: uData?.penaltyCentsSnapshot || m.penaltyCents,
       joinedMidWeek: uData?.joinedMidWeek || false,
+      excused: excusedByUser[mLower] || 0,
     };
   });
   const liveSettlementPreview = calculateWeekSettlement(currentWeekKey, liveMemberInputs);

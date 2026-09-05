@@ -51,6 +51,31 @@ export interface UserWeekData {
   joinedMidWeek?: boolean; // If true, member joined mid-week and paused
 }
 
+export type ExceptionStatus = 'pending' | 'approved' | 'rejected';
+
+/**
+ * A request by one member to be excused for a single planned unit ("Sporttag")
+ * of the CURRENT week. Must be approved by another member. Stored per-request in
+ * the shared session so both partners always see the same state. Never affects
+ * future weeks or the general plan.
+ */
+export interface ExceptionRequest {
+  id: string; // stable id: `${weekKey}:${requester}:${slot}`
+  sessionCode: string;
+  weekKey: string; // the week this exception applies to (current week only)
+  requester: string; // lowercase username of requester
+  requesterId?: string; // permanent user id of requester
+  requesterDisplayName: string;
+  slot: number; // which planned unit slot (0-based) is being excused (informational + dedupe)
+  reasonCode?: string; // 'krank' | 'reise' | 'termin' | 'verletzung' | 'anderer'
+  reasonLabel?: string; // human-readable reason
+  status: ExceptionStatus;
+  createdAt: string; // when the request was made
+  decidedBy?: string; // lowercase username of the partner who decided
+  decidedByDisplayName?: string;
+  decidedAt?: string; // when it was approved/rejected
+}
+
 export interface SettlementEntry {
   from: string; // Lowercase username
   to: string; // Lowercase username
@@ -69,6 +94,7 @@ export interface WeekSettlement {
     completed: number;
     penaltyCents: number;
     missed: number;
+    excused?: number; // approved exceptions counted as neither done nor missed
     debtCents: number;
     isReceiver: boolean;
   }[];
