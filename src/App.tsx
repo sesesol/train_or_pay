@@ -17,6 +17,7 @@ import {
   storageGet,
   storageSet,
   storageList,
+  storageGetMany,
   storageDelete,
   initWindowStoragePolyfill,
 } from './lib/storage.ts';
@@ -28,8 +29,10 @@ import {
 } from './lib/session.ts';
 import {
   loadWeekExceptions,
-  excusedByUser,
+  computeExcusedFor,
+  buildExcusedMap,
   countActiveExceptions,
+  hasActiveWeekException,
   nextSlotForUser,
   exceptionKey,
 } from './lib/exceptions.ts';
@@ -180,23 +183,19 @@ export default function App() {
         }
       }
 
-      // 2. Scan all session keys to discover any session where the user is an active member
+      // 2. Discover any other session where the user is an active member.
+      //    Performance: one batch read of all session meta records instead of a
+      //    separate request per session.
       try {
-        const allSessionKeys = await storageList('session:');
-        const metaKeys = allSessionKeys.filter((k) => k.endsWith(':meta'));
-        for (const mKey of metaKeys) {
-          const code = mKey.replace('session:', '').replace(':meta', '');
-          if (!loadedMap.has(code)) {
-            const session = await storageGet<SessionMeta>(mKey);
-            if (session && session.code) {
-              const isMember = session.members?.some(
-                (m) => m.user.toLowerCase() === userLower.toLowerCase() && m.active
-              );
-              if (isMember) {
-                loadedMap.set(session.code, session);
-              }
-            }
-          }
+        const metas = await storageGetMany('session:', ':meta');
+        for (const [key, session] of Object.entries(metas)) {
+          if (!key.endsWith(':meta')) continue;
+          const meta = session as SessionMeta;
+          if (!meta || !meta.code || loadedMap.has(meta.code)) continue;
+          const isMember = meta.members?.some(
+            (m) => m.user.toLowerCase() === userLower.toLowerCase() && m.active
+          );
+          if (isMember) loadedMap.set(meta.code, meta);
         }
       } catch (_e) {
         // ignore scan errors
@@ -207,75 +206,62 @@ export default function App() {
     []
   );
 
-  // Automatic Idempotent Settlement for Past Weeks (Section 6.3 & 7.2)
+  // Automatic Idempotent Settlement for Past Weeks (Section 6.3 & 7.2).
+  // Works entirely off an already-loaded snapshot of the session subtree, so it
+  // performs no extra reads. New settlements are written back into `all` so the
+  // caller can derive state from a single, consistent snapshot.
   const checkAndRunPastSettlements = useCallback(
-    async (session: SessionMeta) => {
+    async (session: SessionMeta, all: Record<string, any>) => {
       const code = session.code;
-      // List all existing week keys stored for this session
       const weekPrefix = `session:${code}:week:`;
-      const allWeekKeys = await storageList(weekPrefix);
 
-      // Extract unique past week identifiers (e.g., "2026-W11") that are strictly before currentWeekKey
+      // Unique past week identifiers strictly before the current week.
       const pastWeeksSet = new Set<string>();
-      for (const k of allWeekKeys) {
-        const parts = k.replace(weekPrefix, '').split(':');
-        const weekKey = parts[0];
-        if (weekKey && weekKey < currentWeekKey) {
-          pastWeeksSet.add(weekKey);
-        }
+      for (const k of Object.keys(all)) {
+        if (!k.startsWith(weekPrefix)) continue;
+        const weekKey = k.slice(weekPrefix.length).split(':')[0];
+        if (weekKey && weekKey < currentWeekKey) pastWeeksSet.add(weekKey);
       }
+      pastWeeksSet.add(getPreviousBerlinISOWeek(currentWeekKey));
 
-      // Check also the immediate previous week if not present
-      const prevWeek = getPreviousBerlinISOWeek(currentWeekKey);
-      pastWeeksSet.add(prevWeek);
-
-      // Load debts storage
-      let debtsStore = (await storageGet<DebtsStorage>(`session:${code}:debts`)) || {
-        open: [],
-        history: [],
-      };
-
+      const debtsStore: DebtsStorage = all[`session:${code}:debts`] || { open: [], history: [] };
       let hasNewSettlements = false;
 
       for (const pastWeek of Array.from(pastWeeksSet).sort()) {
-        const settlementKey = `session:${code}:week:${pastWeek}:settlement`;
-        const existingSettlement = await storageGet<WeekSettlement>(settlementKey);
+        const settlementKey = `${weekPrefix}${pastWeek}:settlement`;
+        const existingSettlement = all[settlementKey] as WeekSettlement | undefined;
+        if (existingSettlement && existingSettlement.settledAt) continue; // already settled
 
-        if (existingSettlement && existingSettlement.settledAt) {
-          // Already settled idempotently
-          continue;
-        }
+        // Exceptions of that past week, straight from the snapshot.
+        const excPrefix = `${weekPrefix}${pastWeek}:exception:`;
+        const pastExceptions: ExceptionRequest[] = Object.keys(all)
+          .filter((k) => k.startsWith(excPrefix))
+          .map((k) => all[k])
+          .filter((e) => e && e.id);
 
-        // Approved exceptions for that past week -> excused (penalty-free) units.
-        const pastExceptions = await loadWeekExceptions(code, pastWeek);
-        const pastExcused = excusedByUser(pastExceptions);
-
-        // Freshly load all member week data for that past week
-        const memberInputs = [];
-        for (const member of session.members) {
+        const memberInputs = session.members.map((member) => {
           const mLower = member.user.toLowerCase();
-          const userWeekKey = `session:${code}:week:${pastWeek}:user:${mLower}`;
-          const uData = await storageGet<UserWeekData>(userWeekKey);
-
-          memberInputs.push({
+          const uData = all[`${weekPrefix}${pastWeek}:user:${mLower}`] as UserWeekData | undefined;
+          const goal = uData ? uData.goal : 0;
+          const completed = uData ? uData.checks?.length || 0 : 0;
+          return {
             user: mLower,
             displayName: member.displayName,
-            goal: uData ? uData.goal : 0,
-            completed: uData ? uData.checks?.length || 0 : 0,
+            goal,
+            completed,
             penaltyCents: uData?.penaltyCentsSnapshot || member.penaltyCents,
             joinedMidWeek: uData?.joinedMidWeek || false,
-            excused: pastExcused[mLower] || 0,
-          });
-        }
+            excused: computeExcusedFor(pastExceptions, mLower, goal, completed),
+          };
+        });
 
-        // Calculate deterministic settlement
         const settlement = calculateWeekSettlement(pastWeek, memberInputs);
         await storageSet(settlementKey, settlement);
+        all[settlementKey] = settlement;
         hasNewSettlements = true;
 
-        // Generate open debt items from new settlement entries
         for (const entry of settlement.entries) {
-          const newDebtItem: DebtItem = {
+          debtsStore.open.push({
             id: `debt-${code}-${pastWeek}-${entry.from}-${entry.to}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
             from: entry.from,
             to: entry.to,
@@ -283,19 +269,22 @@ export default function App() {
             weekKey: pastWeek,
             status: 'open',
             createdAt: new Date().toISOString(),
-          };
-          debtsStore.open.push(newDebtItem);
+          });
         }
       }
 
       if (hasNewSettlements) {
         await storageSet(`session:${code}:debts`, debtsStore);
+        all[`session:${code}:debts`] = debtsStore;
       }
     },
     [currentWeekKey]
   );
 
-  // Freshly load all data for the active session (Section 2.3).
+  // Freshly load all data for the active session.
+  // Performance: the entire session subtree is fetched in ONE batch request and
+  // everything below is derived locally (previously dozens of sequential round
+  // trips per refresh, repeated by every poll).
   // `silent` is used by background auto-sync so it doesn't flash the spinner or
   // raise error toasts on transient network blips.
   const refreshSessionData = useCallback(
@@ -304,31 +293,38 @@ export default function App() {
       const code = session.code;
 
       try {
-        // 1. Freshly read session meta
-        const freshSession = (await storageGet<SessionMeta>(`session:${code}:meta`)) || session;
+        // 1. One batch read of the whole session subtree.
+        const all = await storageGetMany(`session:${code}:`);
+
+        const freshSession = (all[`session:${code}:meta`] as SessionMeta) || session;
         setCurrentSession(freshSession);
 
-        // 2. Check and run any pending past week settlements
-        await checkAndRunPastSettlements(freshSession);
+        // 2. Settle finished past weeks. This must never block the rest of the
+        //    refresh: a failure here previously aborted the whole function, so
+        //    members' progress was never displayed. It is idempotent and only
+        //    needed on explicit refreshes, not on every background poll.
+        if (!silent) {
+          try {
+            await checkAndRunPastSettlements(freshSession, all);
+          } catch (settleErr) {
+            console.warn('Past-week settlement skipped:', settleErr);
+          }
+        }
 
-        // 3. Freshly read all members' data for the current week
+        // 3. All members' data for the current week (from the snapshot).
         const membersMap: Record<string, UserWeekData> = {};
         for (const member of freshSession.members) {
           const mLower = member.user.toLowerCase();
-          const mKey = `session:${code}:week:${currentWeekKey}:user:${mLower}`;
-          const mData = await storageGet<UserWeekData>(mKey);
-
-          if (mData) {
-            membersMap[mLower] = mData;
-          } else {
-            // No goal set yet for this week -> spec 6.1/11: never defaults to a
-            // nonzero value, always 0 ("pausiert") until the member explicitly plans.
-            membersMap[mLower] = {
-              goal: 0,
-              checks: [],
-              penaltyCentsSnapshot: member.penaltyCents,
-            };
-          }
+          const mData = all[`session:${code}:week:${currentWeekKey}:user:${mLower}`] as
+            | UserWeekData
+            | undefined;
+          // No goal set yet for this week -> spec 6.1/11: never defaults to a
+          // nonzero value, always 0 ("pausiert") until the member explicitly plans.
+          membersMap[mLower] = mData || {
+            goal: 0,
+            checks: [],
+            penaltyCentsSnapshot: member.penaltyCents,
+          };
         }
 
         // If the current user has a write in flight (e.g. just tapped a circle),
@@ -340,7 +336,6 @@ export default function App() {
         }
         setAllMembersCurrentWeek(membersMap);
 
-        // Set my current week data
         const myData = membersMap[userLower] || {
           goal: 0,
           checks: [],
@@ -350,29 +345,30 @@ export default function App() {
         setMyCurrentWeekData(myData);
         myWeekDataRef.current = myData;
 
-        // 3b. Load shared exception requests for the current week (both partners).
-        const exceptions = await loadWeekExceptions(code, currentWeekKey);
+        // 3b. Shared exception requests for the current week (both partners).
+        const excPrefix = `session:${code}:week:${currentWeekKey}:exception:`;
+        const exceptions: ExceptionRequest[] = Object.keys(all)
+          .filter((k) => k.startsWith(excPrefix))
+          .map((k) => all[k])
+          .filter((e) => e && e.id)
+          .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
         setWeekExceptions(exceptions);
 
-        // 4. Read my next week data if planned
-        const nextWeekDataKey = `session:${code}:week:${nextWeekKey}:user:${userLower}`;
-        const nextData = await storageGet<UserWeekData>(nextWeekDataKey);
-        setMyNextWeekData(nextData);
+        // 4. My next week plan
+        setMyNextWeekData(
+          (all[`session:${code}:week:${nextWeekKey}:user:${userLower}`] as UserWeekData) || null
+        );
 
-        // 5. Read debts and settlements
-        const debtsStore = await storageGet<DebtsStorage>(`session:${code}:debts`);
+        // 5. Debts
+        const debtsStore = all[`session:${code}:debts`] as DebtsStorage | undefined;
         setOpenDebts(debtsStore?.open || []);
         setPaymentHistory(debtsStore?.history || []);
 
-        // 6. Read all past settlements for history
-        const allKeys = await storageList(`session:${code}:week:`);
-        const settlementKeys = allKeys.filter((k) => k.endsWith(':settlement'));
-        const loadedSettlements: WeekSettlement[] = [];
-
-        for (const sKey of settlementKeys) {
-          const s = await storageGet<WeekSettlement>(sKey);
-          if (s) loadedSettlements.push(s);
-        }
+        // 6. All past settlements for history
+        const loadedSettlements: WeekSettlement[] = Object.keys(all)
+          .filter((k) => k.endsWith(':settlement'))
+          .map((k) => all[k])
+          .filter(Boolean);
         setSettlements(loadedSettlements);
       } catch (err: any) {
         if (!silent) {
@@ -504,7 +500,11 @@ export default function App() {
 
   // Request an exception ("Ausnahme") for one open planned unit of the current
   // week. Needs a partner's approval; never affects future weeks.
-  const handleRequestException = async (reasonCode?: string, reasonLabel?: string) => {
+  const handleRequestException = async (
+    reasonCode?: string,
+    reasonLabel?: string,
+    kind: 'single' | 'week' = 'single'
+  ) => {
     if (!currentSession || !usernameLower || !currentUser) return;
     const code = currentSession.code;
 
@@ -535,14 +535,31 @@ export default function App() {
     }
 
     try {
-      // Re-read fresh to avoid races and prevent more requests than open units.
+      // Re-read fresh to avoid races and prevent contradictory/duplicate requests.
       const fresh = await loadWeekExceptions(code, currentWeekKey);
-      const active = countActiveExceptions(fresh, usernameLower);
-      const open = goal - completed - active;
-      if (open <= 0) {
-        addToast('info', 'Für diese Woche sind keine offenen Sporttage mehr zum Auslassen vorhanden.');
+
+      // An emergency dropout already covers the whole rest of the week, so no
+      // further request of either kind may be stacked on top of it.
+      if (hasActiveWeekException(fresh, usernameLower)) {
+        addToast('info', 'Es läuft bereits ein Notfall-Ausfall für diese Woche.');
         await refreshSessionData(currentSession, usernameLower);
         return;
+      }
+
+      if (kind === 'week') {
+        // Emergency dropout: needs at least one open unit left to excuse.
+        if (goal - completed <= 0) {
+          addToast('info', 'Du hast diese Woche bereits alle Einheiten erledigt.');
+          await refreshSessionData(currentSession, usernameLower);
+          return;
+        }
+      } else {
+        const active = countActiveExceptions(fresh, usernameLower);
+        if (goal - completed - active <= 0) {
+          addToast('info', 'Für diese Woche sind keine offenen Sporttage mehr zum Auslassen vorhanden.');
+          await refreshSessionData(currentSession, usernameLower);
+          return;
+        }
       }
 
       const slot = nextSlotForUser(fresh, usernameLower);
@@ -553,6 +570,7 @@ export default function App() {
         requester: usernameLower,
         requesterId: currentUser.id,
         requesterDisplayName: currentUser.displayName,
+        kind,
         slot,
         reasonCode,
         reasonLabel,
@@ -560,10 +578,15 @@ export default function App() {
         createdAt: new Date().toISOString(),
       };
       await storageSet(exceptionKey(code, currentWeekKey, usernameLower, slot), req);
-      addToast('success', 'Ausnahme-Anfrage gesendet. Sie wartet auf die Zustimmung deines Partners.');
+      addToast(
+        'success',
+        kind === 'week'
+          ? 'Notfall-Ausfall beantragt. Er wartet auf die Zustimmung deines Partners.'
+          : 'Ausnahme-Anfrage gesendet. Sie wartet auf die Zustimmung deines Partners.'
+      );
       await refreshSessionData(currentSession, usernameLower);
     } catch (e: any) {
-      addToast('error', 'Ausnahme-Anfrage konnte nicht gespeichert werden: ' + (e?.message || ''));
+      addToast('error', 'Anfrage konnte nicht gespeichert werden: ' + (e?.message || ''));
     }
   };
 
@@ -615,7 +638,11 @@ export default function App() {
       addToast(
         'success',
         approve
-          ? `Ausnahme für ${freshReq.requesterDisplayName} genehmigt (Entschuldigt).`
+          ? freshReq.kind === 'week'
+            ? `Notfall-Ausfall für ${freshReq.requesterDisplayName} genehmigt — restliche Woche entschuldigt.`
+            : `Ausnahme für ${freshReq.requesterDisplayName} genehmigt (Entschuldigt).`
+          : freshReq.kind === 'week'
+          ? `Notfall-Ausfall für ${freshReq.requesterDisplayName} abgelehnt.`
           : `Ausnahme für ${freshReq.requesterDisplayName} abgelehnt.`
       );
       await refreshSessionData(currentSession, usernameLower);
@@ -751,7 +778,6 @@ export default function App() {
 
     // Approved exceptions for this week -> excused (penalty-free) units.
     const weekExc = await loadWeekExceptions(code, weekKey);
-    const weekExcused = excusedByUser(weekExc);
 
     // Load member week inputs
     const memberInputs = [];
@@ -768,7 +794,12 @@ export default function App() {
         completed: uData ? (uData.checks?.length || 0) : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.checks?.length || 0) : 0),
         penaltyCents: uData?.penaltyCentsSnapshot || member.penaltyCents,
         joinedMidWeek: uData?.joinedMidWeek || false,
-        excused: weekExcused[mLower] || 0,
+        excused: computeExcusedFor(
+          weekExc,
+          mLower,
+          uData ? uData.goal : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.goal ?? 0) : 0),
+          uData ? (uData.checks?.length || 0) : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.checks?.length || 0) : 0)
+        ),
       });
     }
 
@@ -980,7 +1011,7 @@ export default function App() {
   }
 
   // Derived: current-week excused counts per user + pending requests I must decide.
-  const currentWeekExcused = excusedByUser(weekExceptions);
+  const currentWeekExcused = buildExcusedMap(weekExceptions, allMembersCurrentWeek);
   const pendingExceptionsForMe = weekExceptions.filter(
     (e) => e.status === 'pending' && e.requester.toLowerCase() !== usernameLower
   ).length;

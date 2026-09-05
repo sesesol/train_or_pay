@@ -76,14 +76,59 @@ export function countActiveExceptions(exceptions: ExceptionRequest[], userLower:
   ).length;
 }
 
-/** Build a map of userLower -> approved excused count for settlement inputs. */
-export function excusedByUser(exceptions: ExceptionRequest[]): Record<string, number> {
+/** True if the user has an emergency week dropout that is pending or approved. */
+export function hasActiveWeekException(
+  exceptions: ExceptionRequest[],
+  userLower: string
+): boolean {
+  return byRequester(exceptions, userLower).some(
+    (e) => e.kind === 'week' && (e.status === 'pending' || e.status === 'approved')
+  );
+}
+
+/** True if an APPROVED emergency week dropout is in effect for the user. */
+export function hasApprovedWeekException(
+  exceptions: ExceptionRequest[],
+  userLower: string
+): boolean {
+  return byRequester(exceptions, userLower).some(
+    (e) => e.kind === 'week' && e.status === 'approved'
+  );
+}
+
+/**
+ * Excused units for one user in a week. An approved emergency dropout excuses
+ * every remaining open unit; otherwise each approved single request excuses one
+ * unit. Always capped at the units still open, so it can never over-credit.
+ */
+export function computeExcusedFor(
+  exceptions: ExceptionRequest[],
+  userLower: string,
+  goal: number,
+  completed: number
+): number {
+  const remaining = Math.max(0, (goal || 0) - (completed || 0));
+  if (remaining === 0) return 0;
+  if (hasApprovedWeekException(exceptions, userLower)) return remaining;
+  return Math.min(countApprovedExcused(exceptions, userLower), remaining);
+}
+
+/**
+ * Build userLower -> excused count for settlement inputs, given each member's
+ * week data (goal/completed), which the week-wide dropout depends on.
+ */
+export function buildExcusedMap(
+  exceptions: ExceptionRequest[],
+  weekDataByUser: Record<string, { goal?: number; checks?: unknown[] } | undefined>
+): Record<string, number> {
   const map: Record<string, number> = {};
-  for (const e of exceptions) {
-    if (e.status === 'approved') {
-      const u = e.requester.toLowerCase();
-      map[u] = (map[u] || 0) + 1;
-    }
+  for (const [user, data] of Object.entries(weekDataByUser)) {
+    map[user] = computeExcusedFor(
+      exceptions,
+      user,
+      data?.goal || 0,
+      data?.checks?.length || 0
+    );
   }
   return map;
 }

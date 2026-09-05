@@ -53,6 +53,18 @@ app.post('/api/storage/set', (req, res) => {
   return res.json({ success: true, key });
 });
 
+// Batch read: return every key/value pair under a prefix in ONE request.
+// Avoids dozens of sequential round trips when loading a whole session.
+app.get('/api/storage/entries', (req, res) => {
+  const prefix = (req.query.prefix as string) || '';
+  const suffix = (req.query.suffix as string) || '';
+  const entries: Record<string, string> = {};
+  for (const k of Object.keys(memoryStore)) {
+    if (k.startsWith(prefix) && (!suffix || k.endsWith(suffix))) entries[k] = memoryStore[k];
+  }
+  return res.json({ entries });
+});
+
 app.get('/api/storage/list', (req, res) => {
   const prefix = (req.query.prefix as string) || '';
   const matchedKeys = Object.keys(memoryStore).filter((k) => k.startsWith(prefix));
