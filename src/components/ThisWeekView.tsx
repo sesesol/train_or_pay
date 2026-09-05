@@ -35,7 +35,7 @@ import {
   WorkoutCheck,
   ExceptionRequest,
 } from '../types.ts';
-import { EXCEPTION_REASONS, statusLabel } from '../lib/exceptions.ts';
+import { EXCEPTION_REASONS, statusLabel, hasActiveWeekException, hasApprovedWeekException } from '../lib/exceptions.ts';
 import {
   getBerlinParts,
   getWeekDateRange,
@@ -63,7 +63,11 @@ interface ThisWeekViewProps {
   weekExceptions: ExceptionRequest[];
   excusedByUser: Record<string, number>;
   onUpdateMyWeekData: (weekKey: string, updated: UserWeekData) => Promise<void>;
-  onRequestException: (reasonCode?: string, reasonLabel?: string) => Promise<void> | void;
+  onRequestException: (
+    reasonCode?: string,
+    reasonLabel?: string,
+    kind?: 'single' | 'week'
+  ) => Promise<void> | void;
   onDecideException: (request: ExceptionRequest, approve: boolean) => Promise<void> | void;
   onError: (msg: string) => void;
   onSuccess: (msg: string) => void;
@@ -127,14 +131,23 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
   const hasOtherActiveMember = session.members.some(
     (m) => m.active && m.user.toLowerCase() !== usernameLower
   );
+  const weekDropoutActive = hasActiveWeekException(weekExceptions, usernameLower);
+  const weekDropoutApproved = hasApprovedWeekException(weekExceptions, usernameLower);
   const openForRequest = currentGoal - checksCount - myActiveExceptionCount;
-  const canRequestException = currentGoal > 0 && openForRequest > 0 && hasOtherActiveMember;
+  // A running emergency dropout already covers the rest of the week.
+  const canRequestException =
+    currentGoal > 0 && openForRequest > 0 && hasOtherActiveMember && !weekDropoutActive;
+  const canRequestWeekDropout =
+    currentGoal > 0 && currentGoal - checksCount > 0 && hasOtherActiveMember && !weekDropoutActive;
 
   // Inline reason picker state for requesting an exception.
   const [showReasonPicker, setShowReasonPicker] = useState<boolean>(false);
   const [selectedReason, setSelectedReason] = useState<string>('krank');
   const [customReason, setCustomReason] = useState<string>('');
   const [isSubmittingException, setIsSubmittingException] = useState<boolean>(false);
+
+  // Which kind the open picker is collecting a reason for.
+  const [pickerKind, setPickerKind] = useState<'single' | 'week'>('single');
 
   const submitException = async () => {
     const opt = EXCEPTION_REASONS.find((r) => r.code === selectedReason);
@@ -144,10 +157,11 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
         : opt?.label;
     setIsSubmittingException(true);
     try {
-      await onRequestException(selectedReason, label);
+      await onRequestException(selectedReason, label, pickerKind);
       setShowReasonPicker(false);
       setCustomReason('');
       setSelectedReason('krank');
+      setPickerKind('single');
     } finally {
       setIsSubmittingException(false);
     }
@@ -394,28 +408,63 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
               >
                 <Clock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                 <p className="leading-relaxed">
-                  <strong className="text-amber-300">Ausnahme angefragt{req.reasonLabel ? ` (${req.reasonLabel})` : ''}.</strong>{' '}
+                  <strong className="text-amber-300">
+                    {req.kind === 'week' ? 'Notfall-Ausfall' : 'Ausnahme'} angefragt
+                    {req.reasonLabel ? ` (${req.reasonLabel})` : ''}.
+                  </strong>{' '}
                   Wartet auf Zustimmung deines Partners.
                 </p>
               </div>
             ))}
 
+            {/* Approved emergency dropout banner */}
+            {weekDropoutApproved && (
+              <div className="p-3 bg-amber-400/15 border border-amber-400/40 rounded-2xl text-xs text-amber-200 flex items-start gap-2.5">
+                <ShieldCheck className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <p className="leading-relaxed">
+                  <strong className="text-amber-300">Notfall-Ausfall genehmigt.</strong> Alle offenen
+                  Einheiten dieser Woche sind entschuldigt — keine Strafe. Nächste Woche läuft normal weiter.
+                </p>
+              </div>
+            )}
+
             {!showReasonPicker ? (
-              canRequestException && (
-                <button
-                  type="button"
-                  id="request-exception-btn"
-                  onClick={() => setShowReasonPicker(true)}
-                  className="w-full min-h-[44px] py-2.5 px-4 bg-white/5 hover:bg-amber-400/10 border border-amber-400/30 hover:border-amber-400/60 text-amber-200 font-black uppercase tracking-wider rounded-2xl text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  <CalendarX className="w-4 h-4" />
-                  Sporttag ausnahmsweise auslassen
-                </button>
-              )
+              <div className="flex flex-col gap-2">
+                {canRequestException && (
+                  <button
+                    type="button"
+                    id="request-exception-btn"
+                    onClick={() => {
+                      setPickerKind('single');
+                      setShowReasonPicker(true);
+                    }}
+                    className="w-full min-h-[44px] py-2.5 px-4 bg-white/5 hover:bg-amber-400/10 border border-amber-400/30 hover:border-amber-400/60 text-amber-200 font-black uppercase tracking-wider rounded-2xl text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <CalendarX className="w-4 h-4" />
+                    Sporttag ausnahmsweise auslassen
+                  </button>
+                )}
+                {canRequestWeekDropout && (
+                  <button
+                    type="button"
+                    id="request-week-dropout-btn"
+                    onClick={() => {
+                      setPickerKind('week');
+                      setShowReasonPicker(true);
+                    }}
+                    className="w-full min-h-[44px] py-2.5 px-4 bg-red-500/10 hover:bg-red-500/20 border border-red-500/40 hover:border-red-500/70 text-red-200 font-black uppercase tracking-wider rounded-2xl text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <AlertTriangle className="w-4 h-4" />
+                    Notfall: Restliche Woche ausfallen lassen
+                  </button>
+                )}
+              </div>
             ) : (
               <div className="p-4 bg-black/40 border border-amber-400/30 rounded-2xl flex flex-col gap-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-black uppercase tracking-wider text-amber-200">Grund (optional)</span>
+                  <span className="text-xs font-black uppercase tracking-wider text-amber-200">
+                    {pickerKind === 'week' ? 'Notfall-Ausfall — Grund' : 'Grund (optional)'}
+                  </span>
                   <button
                     type="button"
                     onClick={() => setShowReasonPicker(false)}
@@ -452,7 +501,9 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                   />
                 )}
                 <p className="text-[11px] text-white/50 leading-relaxed">
-                  Deine Anfrage wird an die Gruppe gesendet und muss von einem anderen Mitglied bestätigt werden. Zukünftige Wochen bleiben unverändert.
+                  {pickerKind === 'week'
+                    ? `Notfall-Ausfall: Alle ${Math.max(0, currentGoal - checksCount)} noch offenen Einheiten dieser Woche werden entschuldigt, sobald ein anderes Mitglied zustimmt. Bereits erledigte Einheiten bleiben erhalten, zukünftige Wochen bleiben unverändert.`
+                    : 'Deine Anfrage wird an die Gruppe gesendet und muss von einem anderen Mitglied bestätigt werden. Zukünftige Wochen bleiben unverändert.'}
                 </p>
                 <button
                   type="button"
@@ -462,7 +513,11 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                   className="w-full min-h-[44px] py-2.5 px-4 bg-amber-400 hover:scale-[1.02] active:scale-95 text-black font-black uppercase tracking-wider rounded-2xl text-xs transition-all disabled:opacity-40 flex items-center justify-center gap-2 cursor-pointer shadow-lg"
                 >
                   <Send className="w-4 h-4" />
-                  {isSubmittingException ? 'Sende...' : 'Ausnahme-Anfrage senden'}
+                  {isSubmittingException
+                    ? 'Sende...'
+                    : pickerKind === 'week'
+                    ? 'Notfall-Ausfall beantragen'
+                    : 'Ausnahme-Anfrage senden'}
                 </button>
               </div>
             )}
@@ -479,13 +534,23 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
               className="bg-amber-400/10 border-2 border-amber-400/40 rounded-3xl p-5 shadow-xl flex flex-col gap-4"
             >
               <div className="flex items-start gap-3">
-                <div className="w-10 h-10 rounded-2xl bg-amber-400 text-black flex items-center justify-center shrink-0">
-                  <CalendarX className="w-5 h-5 stroke-[2.5]" />
+                <div className={`w-10 h-10 rounded-2xl text-black flex items-center justify-center shrink-0 ${req.kind === 'week' ? 'bg-red-400' : 'bg-amber-400'}`}>
+                  {req.kind === 'week' ? (
+                    <AlertTriangle className="w-5 h-5 stroke-[2.5]" />
+                  ) : (
+                    <CalendarX className="w-5 h-5 stroke-[2.5]" />
+                  )}
                 </div>
                 <div className="flex flex-col min-w-0">
-                  <h3 className="text-sm font-black uppercase tracking-tight text-white">Ausnahme-Anfrage</h3>
+                  <h3 className="text-sm font-black uppercase tracking-tight text-white">
+                    {req.kind === 'week' ? 'Notfall-Ausfall-Anfrage' : 'Ausnahme-Anfrage'}
+                  </h3>
                   <p className="text-xs text-white/70 leading-relaxed mt-0.5">
-                    <strong className="text-amber-200">{req.requesterDisplayName}</strong> möchte einen geplanten Sporttag diese Woche ausnahmsweise auslassen{req.reasonLabel ? <> — Grund: <strong className="text-white">{req.reasonLabel}</strong></> : ''}.
+                    <strong className="text-amber-200">{req.requesterDisplayName}</strong>{' '}
+                    {req.kind === 'week'
+                      ? 'kann diese Woche nicht weiter trainieren und möchte alle noch offenen Einheiten ausfallen lassen'
+                      : 'möchte einen geplanten Sporttag diese Woche ausnahmsweise auslassen'}
+                    {req.reasonLabel ? <> — Grund: <strong className="text-white">{req.reasonLabel}</strong></> : ''}.
                   </p>
                 </div>
               </div>
@@ -776,7 +841,10 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                   >
                     <span className="text-white/80 min-w-0 truncate">
                       <strong className="text-white">{req.requesterDisplayName}</strong>
-                      {req.reasonLabel ? <span className="text-white/50"> — {req.reasonLabel}</span> : ''}
+                      <span className="text-white/50">
+                        {' '}— {req.kind === 'week' ? 'Notfall-Ausfall' : 'Sporttag'}
+                        {req.reasonLabel ? ` (${req.reasonLabel})` : ''}
+                      </span>
                     </span>
                     <span className={`px-2 py-0.5 rounded-md border font-black uppercase tracking-wider text-[9px] shrink-0 ${badge}`}>
                       {statusLabel(req.status)}

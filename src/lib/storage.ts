@@ -200,6 +200,55 @@ export async function storageList(prefix: string): Promise<string[]> {
   }
 }
 
+/**
+ * Batch read: load every key/value under a prefix. Uses the server's single
+ * /api/storage/entries request when available (one round trip for a whole
+ * session instead of dozens), and transparently falls back to list+get when the
+ * host provides its own window.storage or the endpoint is unavailable.
+ */
+export async function storageGetMany(
+  prefix: string,
+  suffix = ''
+): Promise<Record<string, any>> {
+  const out: Record<string, any> = {};
+
+  try {
+    const url =
+      `/api/storage/entries?prefix=${encodeURIComponent(prefix)}` +
+      (suffix ? `&suffix=${encodeURIComponent(suffix)}` : '');
+    const res = await fetch(url);
+    if (res.ok) {
+      const data = await res.json();
+      const entries = data && data.entries;
+      if (entries && typeof entries === 'object') {
+        for (const [k, raw] of Object.entries(entries as Record<string, string>)) {
+          if (typeof raw !== 'string') continue;
+          try {
+            out[k] = JSON.parse(raw);
+            // Keep the supporting cache in sync, but only write when the value
+            // actually changed: a poll otherwise rewrites the whole subtree to
+            // localStorage (synchronous and needlessly slow) every time.
+            if (clientFallbackMap[k] !== raw) setLocalFallback(k, raw);
+          } catch (_e) {
+            // skip unparsable entries
+          }
+        }
+        return out;
+      }
+    }
+  } catch (_e) {
+    // fall through to the portable path below
+  }
+
+  // Fallback: enumerate then read individually (host-provided window.storage).
+  const keys = (await storageList(prefix)).filter((k) => !suffix || k.endsWith(suffix));
+  for (const k of keys) {
+    const v = await storageGet<any>(k);
+    if (v !== null) out[k] = v;
+  }
+  return out;
+}
+
 export async function storageDelete(key: string): Promise<boolean> {
   if (!window.storage) {
     initWindowStoragePolyfill();

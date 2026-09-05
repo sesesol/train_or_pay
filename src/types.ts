@@ -66,6 +66,14 @@ export interface ExceptionRequest {
   requester: string; // lowercase username of requester
   requesterId?: string; // permanent user id of requester
   requesterDisplayName: string;
+  /**
+   * 'single' excuses exactly one planned unit.
+   * 'week'   is the emergency dropout ("Notfall-Ausfall"): once approved it
+   *          excuses ALL remaining open units of the current week.
+   * Optional for backward compatibility with records written before this field
+   * existed; missing means 'single'.
+   */
+  kind?: 'single' | 'week';
   slot: number; // which planned unit slot (0-based) is being excused (informational + dedupe)
   reasonCode?: string; // 'krank' | 'reise' | 'termin' | 'verletzung' | 'anderer'
   reasonLabel?: string; // human-readable reason
