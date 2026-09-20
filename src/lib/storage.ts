@@ -77,7 +77,9 @@ export function initWindowStoragePolyfill() {
     window.storage = {
       async get(key: string, _shared = true): Promise<string> {
         try {
-          const res = await fetch(`/api/storage/get?key=${encodeURIComponent(key)}`);
+          const res = await fetch(`/api/storage/get?key=${encodeURIComponent(key)}&_t=${Date.now()}`, {
+            cache: 'no-store',
+          });
           if (!res.ok) {
             const fallback = getLocalFallback(key);
             if (fallback !== null) return fallback;
@@ -107,6 +109,7 @@ export function initWindowStoragePolyfill() {
         try {
           const res = await fetch('/api/storage/set', {
             method: 'POST',
+            cache: 'no-store',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ key, value }),
           });
@@ -123,7 +126,9 @@ export function initWindowStoragePolyfill() {
       async list(prefix = '', _shared = true): Promise<string[]> {
         const localKeys = listLocalFallback(prefix);
         try {
-          const res = await fetch(`/api/storage/list?prefix=${encodeURIComponent(prefix)}`);
+          const res = await fetch(`/api/storage/list?prefix=${encodeURIComponent(prefix)}&_t=${Date.now()}`, {
+            cache: 'no-store',
+          });
           if (!res.ok) {
             return localKeys;
           }
@@ -141,6 +146,7 @@ export function initWindowStoragePolyfill() {
         try {
           const res = await fetch(`/api/storage/delete?key=${encodeURIComponent(key)}`, {
             method: 'DELETE',
+            cache: 'no-store',
           });
           if (!res.ok && res.status !== 404) {
             console.warn(`Delete warning: ${key}`);
@@ -215,20 +221,22 @@ export async function storageGetMany(
   try {
     const url =
       `/api/storage/entries?prefix=${encodeURIComponent(prefix)}` +
-      (suffix ? `&suffix=${encodeURIComponent(suffix)}` : '');
-    const res = await fetch(url);
+      (suffix ? `&suffix=${encodeURIComponent(suffix)}` : '') +
+      `&_t=${Date.now()}`;
+    const res = await fetch(url, { cache: 'no-store' });
     if (res.ok) {
       const data = await res.json();
       const entries = data && data.entries;
       if (entries && typeof entries === 'object') {
-        for (const [k, raw] of Object.entries(entries as Record<string, string>)) {
-          if (typeof raw !== 'string') continue;
+        for (const [k, raw] of Object.entries(entries as Record<string, any>)) {
+          if (raw === null || typeof raw === 'undefined') continue;
           try {
-            out[k] = JSON.parse(raw);
-            // Keep the supporting cache in sync, but only write when the value
-            // actually changed: a poll otherwise rewrites the whole subtree to
-            // localStorage (synchronous and needlessly slow) every time.
-            if (clientFallbackMap[k] !== raw) setLocalFallback(k, raw);
+            if (typeof raw === 'object') {
+              out[k] = raw;
+            } else if (typeof raw === 'string') {
+              out[k] = JSON.parse(raw);
+              if (clientFallbackMap[k] !== raw) setLocalFallback(k, raw);
+            }
           } catch (_e) {
             // skip unparsable entries
           }
@@ -260,4 +268,75 @@ export async function storageDelete(key: string): Promise<boolean> {
     console.error(`Storage delete failed for key "${key}":`, err);
     return false;
   }
+}
+
+export type StorageChangeCallback = (key: string, value: string) => void;
+export type StreamStatusCallback = (connected: boolean) => void;
+
+/**
+ * Subscribe to real-time Server-Sent Events (SSE) so that any check-in or change
+ * made by any member is immediately pushed to this client with zero delay.
+ */
+export function subscribeToStorageStream(
+  onChange: StorageChangeCallback,
+  onStatusChange?: StreamStatusCallback
+): () => void {
+  if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
+    return () => {};
+  }
+
+  let es: EventSource | null = null;
+  let active = true;
+  let reconnectTimer: any = null;
+
+  const connect = () => {
+    if (!active) return;
+    try {
+      es = new EventSource(`/api/storage/stream?_t=${Date.now()}`);
+
+      es.addEventListener('connected', () => {
+        if (active && onStatusChange) onStatusChange(true);
+      });
+
+      es.addEventListener('ping', () => {
+        if (active && onStatusChange) onStatusChange(true);
+      });
+
+      es.addEventListener('storage_change', (event) => {
+        if (!active) return;
+        try {
+          const data = JSON.parse(event.data);
+          if (data && data.key) {
+            onChange(data.key, data.value);
+          }
+        } catch (_e) {}
+      });
+
+      es.onerror = () => {
+        if (active && onStatusChange) onStatusChange(false);
+        if (es) {
+          es.close();
+          es = null;
+        }
+        if (active) {
+          reconnectTimer = setTimeout(connect, 3000);
+        }
+      };
+    } catch (_e) {
+      if (active && onStatusChange) onStatusChange(false);
+      if (active) reconnectTimer = setTimeout(connect, 4000);
+    }
+  };
+
+  connect();
+
+  return () => {
+    active = false;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    if (es) {
+      es.close();
+      es = null;
+    }
+    if (onStatusChange) onStatusChange(false);
+  };
 }

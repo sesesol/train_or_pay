@@ -19,6 +19,7 @@ import {
   storageList,
   storageGetMany,
   storageDelete,
+  subscribeToStorageStream,
   initWindowStoragePolyfill,
 } from './lib/storage.ts';
 import {
@@ -140,6 +141,10 @@ export default function App() {
   const refreshRef = useRef<((s: SessionMeta, u: string, silent?: boolean) => Promise<void>) | null>(null);
   const pendingMyWriteRef = useRef<number>(0);
   const myWeekDataRef = useRef<UserWeekData | null>(null);
+  const currentSessionRef = useRef<SessionMeta | null>(currentSession);
+  currentSessionRef.current = currentSession;
+  const usernameLowerRef = useRef<string>(usernameLower);
+  usernameLowerRef.current = usernameLower;
 
   // Debts & Settlements
   const [openDebts, setOpenDebts] = useState<DebtItem[]>([]);
@@ -149,6 +154,7 @@ export default function App() {
   // UI state
   const [isLoadingSession, setIsLoadingSession] = useState<boolean>(false);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [isLiveConnected, setIsLiveConnected] = useState<boolean>(false);
   const [isRestoringSession, setIsRestoringSession] = useState<boolean>(true);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
@@ -391,17 +397,57 @@ export default function App() {
     refreshRef.current = refreshSessionData;
   });
 
-  // Auto-sync: because this key-value backend has no realtime push, poll the
-  // shared session on an interval and whenever the tab regains focus, so each
-  // partner reliably sees the other's latest checks and exception decisions.
+  // Real-time synchronization: subscribe to Server-Sent Events (SSE).
+  // The moment any partner checks off a day or changes their status,
+  // the server broadcasts the event and this client updates immediately.
   useEffect(() => {
-    if (!currentSession || !usernameLower) return;
+    if (!currentSession?.code || !usernameLower) return;
+    const sessionCode = currentSession.code;
+
+    let debounceTimer: any = null;
+    const unsubscribe = subscribeToStorageStream(
+      (changedKey: string) => {
+        // React immediately if the key affects our active session, debts, or demo reset
+        if (
+          changedKey === '__RESET__' ||
+          changedKey.startsWith(`session:${sessionCode}:`) ||
+          changedKey.startsWith(`user:${usernameLowerRef.current}`)
+        ) {
+          if (debounceTimer) clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            const activeSession = currentSessionRef.current;
+            const uLower = usernameLowerRef.current;
+            if (activeSession && uLower && refreshRef.current) {
+              refreshRef.current(activeSession, uLower, true).catch(() => {});
+            }
+          }, 50);
+        }
+      },
+      (connected) => {
+        setIsLiveConnected(connected);
+      }
+    );
+
+    return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      unsubscribe();
+    };
+  }, [currentSession?.code, usernameLower]);
+
+  // Fast auto-sync fallback: poll every 3.5 seconds and on focus / tab visibility,
+  // ensuring full data synchronization even if an SSE connection is dropped or throttled.
+  useEffect(() => {
+    if (!currentSession?.code || !usernameLower) return;
     const doSync = () => {
       if (typeof document !== 'undefined' && document.hidden) return;
       const fn = refreshRef.current;
-      if (fn) fn(currentSession, usernameLower, true).catch(() => {});
+      const activeSession = currentSessionRef.current;
+      const uLower = usernameLowerRef.current;
+      if (fn && activeSession && uLower) {
+        fn(activeSession, uLower, true).catch(() => {});
+      }
     };
-    const interval = window.setInterval(doSync, 15000);
+    const interval = window.setInterval(doSync, 3500);
     const onVisibility = () => {
       if (typeof document !== 'undefined' && !document.hidden) doSync();
     };
@@ -412,7 +458,6 @@ export default function App() {
       document.removeEventListener('visibilitychange', onVisibility);
       window.removeEventListener('focus', doSync);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSession?.code, usernameLower]);
 
   // Login handler
@@ -1025,11 +1070,15 @@ export default function App() {
           onSelectTab={setCurrentTab}
           session={currentSession}
           currentUser={currentUser}
-          onRefresh={() => refreshSessionData(currentSession, usernameLower)}
+          onRefresh={async () => {
+            await refreshSessionData(currentSession, usernameLower, false);
+            addToast('success', 'Daten erfolgreich aktualisiert');
+          }}
           isRefreshing={isRefreshing}
           onSwitchSession={() => setShowSessionModal(true)}
           openDebtsCount={openDebts.filter((d) => d.status !== 'paid').length}
           weekBadgeCount={pendingExceptionsForMe}
+          isLiveConnected={isLiveConnected}
         />
       )}
 

@@ -8,6 +8,25 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
+// Set of active SSE client connections for real-time synchronization
+const sseClients = new Set<express.Response>();
+
+function notifyStorageChange(key: string, value: string) {
+  if (sseClients.size === 0) return;
+  const payload = JSON.stringify({ key, value, ts: Date.now() });
+  const deadClients: express.Response[] = [];
+  for (const client of sseClients) {
+    try {
+      client.write(`event: storage_change\ndata: ${payload}\n\n`);
+    } catch (_e) {
+      deadClients.push(client);
+    }
+  }
+  for (const dead of deadClients) {
+    sseClients.delete(dead);
+  }
+}
+
 // In-memory + persistent file storage for shared key-value store
 const DATA_FILE = path.join(process.cwd(), '.storage_data.json');
 let memoryStore: Record<string, string> = {};
@@ -30,6 +49,41 @@ function saveStore() {
   }
 }
 
+// Ensure NO intermediate caching or browser heuristic caching for any storage API
+app.use('/api/storage', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
+
+// Real-time Server-Sent Events (SSE) stream for instant synchronization
+app.get('/api/storage/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  res.write(`event: connected\ndata: {"status":"connected","serverTime":${Date.now()}}\n\n`);
+  sseClients.add(res);
+
+  // Keep-alive heartbeat ping every 20 seconds to prevent proxy / container timeouts
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(`event: ping\ndata: {}\n\n`);
+    } catch (_e) {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    }
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(keepAlive);
+    sseClients.delete(res);
+  });
+});
+
 // REST API for window.storage shared persistence
 app.get('/api/storage/get', (req, res) => {
   const key = req.query.key as string;
@@ -48,8 +102,10 @@ app.post('/api/storage/set', (req, res) => {
   if (!key || typeof value === 'undefined') {
     return res.status(400).json({ error: 'Key and value are required' });
   }
-  memoryStore[key] = typeof value === 'string' ? value : JSON.stringify(value);
+  const stringValue = typeof value === 'string' ? value : JSON.stringify(value);
+  memoryStore[key] = stringValue;
   saveStore();
+  notifyStorageChange(key, stringValue);
   return res.json({ success: true, key });
 });
 
@@ -79,16 +135,18 @@ app.delete('/api/storage/delete', (req, res) => {
   if (Object.prototype.hasOwnProperty.call(memoryStore, key)) {
     delete memoryStore[key];
     saveStore();
+    notifyStorageChange(key, '__DELETED__');
     return res.json({ success: true, deleted: key });
   } else {
     return res.status(404).json({ error: `Key not found: ${key}` });
   }
 });
 
-app.post('/api/storage/reset-demo', (req, res) => {
+app.post('/api/storage/reset-demo', (_req, res) => {
   // Clear or seed demo data
   memoryStore = {};
   saveStore();
+  notifyStorageChange('__RESET__', '');
   return res.json({ success: true });
 });
 

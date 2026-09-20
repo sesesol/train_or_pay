@@ -28,6 +28,7 @@ interface NavbarProps {
   onSwitchSession: () => void;
   openDebtsCount: number;
   weekBadgeCount?: number; // pending exception requests awaiting my decision
+  isLiveConnected?: boolean;
 }
 
 export const TopNavbar: React.FC<NavbarProps> = ({
@@ -36,6 +37,7 @@ export const TopNavbar: React.FC<NavbarProps> = ({
   onRefresh,
   isRefreshing,
   onSwitchSession,
+  isLiveConnected,
 }) => {
   return (
     <header className="sticky top-0 z-30 bg-[#0A0A0A]/90 backdrop-blur-md border-b border-white/10 px-4 py-3">
@@ -64,28 +66,34 @@ export const TopNavbar: React.FC<NavbarProps> = ({
           </div>
         </button>
 
-        {/* Right actions: Refresh button & User Badge */}
-        <div className="flex items-center gap-2 shrink-0">
+        {/* Right actions: Live sync indicator, Refresh button & User Badge */}
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           <button
             type="button"
             id="navbar-refresh-btn"
             onClick={onRefresh}
             disabled={isRefreshing}
-            className="p-2 text-white/50 hover:text-[#DFFF00] hover:bg-white/5 rounded-xl transition-colors cursor-pointer"
-            title="Session aktualisieren"
+            className="p-2 text-white/50 hover:text-[#DFFF00] hover:bg-white/5 rounded-xl transition-colors cursor-pointer relative"
+            title={isLiveConnected ? "Echtzeit aktiv – Jetzt manuell prüfen" : "Session aktualisieren"}
             aria-label="Session aktualisieren"
           >
             <RefreshCw className={`w-4 h-4 ${isRefreshing ? 'animate-spin text-[#DFFF00]' : ''}`} />
+            {isLiveConnected && !isRefreshing && (
+              <span
+                className="absolute top-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-[#DFFF00] shadow-[0_0_6px_#DFFF00]"
+                title="Live synchronisiert"
+              />
+            )}
           </button>
 
           <button
             type="button"
             id="navbar-user-badge"
             onClick={onSwitchSession}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-xs font-bold text-white uppercase tracking-wider cursor-pointer transition-colors"
+            className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-xs font-bold text-white uppercase tracking-wider cursor-pointer transition-colors"
           >
             <span className="w-2 h-2 rounded-full bg-[#DFFF00]" />
-            <span className="truncate max-w-[85px]">{currentUser.displayName}</span>
+            <span className="truncate max-w-[75px] sm:max-w-[90px]">{currentUser.displayName}</span>
           </button>
         </div>
       </div>
