@@ -89,8 +89,9 @@ export function readLoginSession(): PersistedLoginSession | null {
     const raw = window.localStorage.getItem(SESSION_KEY);
     if (!raw) return null;
     const record = JSON.parse(raw) as PersistedLoginSession;
-    if (!record || !record.usernameLower) return null;
-    if (record.expiresAt && new Date(record.expiresAt).getTime() < Date.now()) {
+    if (!record || typeof record.usernameLower !== 'string' || !record.usernameLower ||
+        typeof record.userId !== 'string' || !record.userId ||
+        !Number.isFinite(Date.parse(record.expiresAt)) || Date.parse(record.expiresAt) <= Date.now()) {
       clearLoginSession();
       return null;
     }
