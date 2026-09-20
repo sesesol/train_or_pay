@@ -5,10 +5,9 @@
 
 import React, { useState } from 'react';
 import { Plus, LogIn, Users, Shield, ArrowRight, AlertTriangle, Sparkles, Check } from 'lucide-react';
-import { SessionMeta, SessionMember, UserProfile } from '../types.ts';
-import { storageGet, storageSet } from '../lib/storage.ts';
-import { formatEuro } from '../lib/settlement.ts';
-import { getBerlinParts, getBerlinISOWeek } from '../lib/time.ts';
+import { SessionMeta, UserProfile } from '../types.ts';
+import { apiRequest } from '../lib/api.ts';
+import { getBerlinParts } from '../lib/time.ts';
 
 interface SessionSelectModalProps {
   currentUser: UserProfile;
@@ -20,17 +19,6 @@ interface SessionSelectModalProps {
   onSessionCreatedOrJoined: (session: SessionMeta) => void;
   onError: (msg: string) => void;
   onLogout: () => void;
-}
-
-// Characters allowed: uppercase letters + digits without 0, O, 1, I, L
-const CODE_CHARS = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
-
-function generateJoinCode(): string {
-  let result = '';
-  for (let i = 0; i < 6; i++) {
-    result += CODE_CHARS.charAt(Math.floor(Math.random() * CODE_CHARS.length));
-  }
-  return result;
 }
 
 export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
@@ -45,7 +33,7 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
   onLogout,
 }) => {
   const [tab, setTab] = useState<'list' | 'create' | 'join'>(
-    prefillCode ? 'join' : sessions.length === 0 ? 'join' : 'list'
+    prefillCode ? 'join' : 'list'
   );
   const [sessionName, setSessionName] = useState('');
   const [joinCodeInput, setJoinCodeInput] = useState(prefillCode || '');
@@ -63,55 +51,9 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
 
     setIsLoading(true);
     try {
-      // Generate unique code with up to 10 attempts
-      let code = '';
-      let isUnique = false;
-      for (let attempt = 0; attempt < 10; attempt++) {
-        const candidate = generateJoinCode();
-        const existing = await storageGet<SessionMeta>(`session:${candidate}:meta`);
-        if (!existing) {
-          code = candidate;
-          isUnique = true;
-          break;
-        }
-      }
-
-      if (!isUnique || !code) {
-        setErrorMsg('Konnte keinen eindeutigen Code generieren. Bitte erneut versuchen.');
-        setIsLoading(false);
-        return;
-      }
-
-      const penaltyCents = Math.round(penaltyEuro * 100);
-      const newMember: SessionMember = {
-        user: usernameLower,
-        userId: currentUser.id,
-        displayName: currentUser.displayName,
-        joinedAt: new Date().toISOString(),
-        penaltyCents,
-        active: true,
-      };
-
-      const newSession: SessionMeta = {
-        code,
-        name: cleanName,
-        createdAt: new Date().toISOString(),
-        adminUser: usernameLower,
-        members: [newMember],
-        settings: {
-          allowMultiplePerDay: false,
-        },
-      };
-
-      await storageSet(`session:${code}:meta`, newSession);
-
-      // Add to user sessions list
-      const updatedUserSessions = Array.from(new Set([...(currentUser.sessions || []), code]));
-      const updatedProfile: UserProfile = {
-        ...currentUser,
-        sessions: updatedUserSessions,
-      };
-      await storageSet(`user:${usernameLower}`, updatedProfile);
+      const { session: newSession } = await apiRequest<{ session: SessionMeta }>('/groups/create', {
+        name: cleanName, penaltyCents: Math.round(penaltyEuro * 100),
+      });
 
       onSessionCreatedOrJoined(newSession);
     } catch (e: any) {
@@ -131,81 +73,9 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
 
     setIsLoading(true);
     try {
-      const session = await storageGet<SessionMeta>(`session:${cleanCode}:meta`);
-      if (!session) {
-        setErrorMsg(`Keine Session mit dem Code "${cleanCode}" gefunden.`);
-        setIsLoading(false);
-        return;
-      }
-
-      // Check if already a member
-      const existingMember = session.members.find((m) => m.user.toLowerCase() === usernameLower);
-      if (existingMember) {
-        // Re-activate if was inactive and/or backfill the permanent user id.
-        let changed = false;
-        if (!existingMember.active) {
-          existingMember.active = true;
-          changed = true;
-        }
-        if (!existingMember.userId && currentUser.id) {
-          existingMember.userId = currentUser.id;
-          changed = true;
-        }
-        if (changed) {
-          await storageSet(`session:${cleanCode}:meta`, session);
-        }
-        onSelectSession(session);
-        setIsLoading(false);
-        return;
-      }
-
-      // Check member count limit (20 max)
-      const activeCount = session.members.filter((m) => m.active).length;
-      if (activeCount >= 20) {
-        setErrorMsg('Diese Session ist voll (maximal 20 Mitglieder).');
-        setIsLoading(false);
-        return;
-      }
-
-      const penaltyCents = Math.round(penaltyEuro * 100);
-      const newMember: SessionMember = {
-        user: usernameLower,
-        userId: currentUser.id,
-        displayName: currentUser.displayName,
-        joinedAt: new Date().toISOString(),
-        penaltyCents,
-        active: true,
-      };
-
-      const updatedMembers = [...session.members, newMember];
-      const updatedSession: SessionMeta = {
-        ...session,
-        members: updatedMembers,
-      };
-
-      await storageSet(`session:${cleanCode}:meta`, updatedSession);
-
-      // Section 5.2/11: joining mid-week (Tue-Sun) means no participation in the
-      // running week -> explicitly persist goal 0 / no penalty / no payout, rather
-      // than relying on a fallback default that could drift out of sync later.
-      if (isMidWeek) {
-        const joinWeekKey = getBerlinISOWeek(new Date());
-        await storageSet(`session:${cleanCode}:week:${joinWeekKey}:user:${usernameLower}`, {
-          goal: 0,
-          checks: [],
-          penaltyCentsSnapshot: penaltyCents,
-          joinedMidWeek: true,
-          lockedAt: new Date().toISOString(),
-        });
-      }
-
-      // Add to user profile sessions
-      const updatedUserSessions = Array.from(new Set([...(currentUser.sessions || []), cleanCode]));
-      const updatedProfile: UserProfile = {
-        ...currentUser,
-        sessions: updatedUserSessions,
-      };
-      await storageSet(`user:${usernameLower}`, updatedProfile);
+      const { session: updatedSession } = await apiRequest<{ session: SessionMeta }>('/groups/join', {
+        code: cleanCode, penaltyCents: Math.round(penaltyEuro * 100),
+      });
 
       onSessionCreatedOrJoined(updatedSession);
     } catch (e: any) {

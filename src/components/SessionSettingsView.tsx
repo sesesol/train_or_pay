@@ -36,7 +36,6 @@ interface SessionSettingsViewProps {
   onSwitchSession: () => void;
   onError: (msg: string) => void;
   onSuccess: (msg: string) => void;
-  onSeedDemoGroup: () => Promise<void>;
 }
 
 export const SessionSettingsView: React.FC<SessionSettingsViewProps> = ({
@@ -51,7 +50,6 @@ export const SessionSettingsView: React.FC<SessionSettingsViewProps> = ({
   onSwitchSession,
   onError,
   onSuccess,
-  onSeedDemoGroup,
 }) => {
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);

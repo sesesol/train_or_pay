@@ -21,12 +21,7 @@ import {
   storageDelete,
   initWindowStoragePolyfill,
 } from './lib/storage.ts';
-import {
-  ensureUserId,
-  saveLoginSession,
-  readLoginSession,
-  clearLoginSession,
-} from './lib/session.ts';
+import { apiRequest } from './lib/api.ts';
 import {
   loadWeekExceptions,
   computeExcusedFor,
@@ -58,54 +53,22 @@ export default function App() {
     initWindowStoragePolyfill();
   }, []);
 
-  // Attempt to restore a persisted login session on startup. The persisted
-  // record is only a pointer (user_id + username); the actual account is always
-  // re-loaded fresh from the database, which remains the source of truth.
+  // Only the server can authenticate a returning device; localStorage is never proof.
   useEffect(() => {
     let cancelled = false;
-
     const restore = async () => {
-      const record = readLoginSession();
-      if (!record) {
-        if (!cancelled) setIsRestoringSession(false);
-        return;
-      }
-
       try {
-        const dbProfile = await storageGet<UserProfile>(`user:${record.usernameLower}`);
-
-        // Only auto-login if the account still exists AND matches the stored
-        // permanent id (guards against a reused/renamed username on the server).
-        if (dbProfile && (!dbProfile.id || dbProfile.id === record.userId)) {
-          if (cancelled) return;
-          // Parse a possible ?join=CODE / #join=CODE invite so it still works.
-          let prefill: string | undefined;
-          try {
-            const src = `${window.location.hash} ${window.location.search}`;
-            const match = src.match(/join=([A-Za-z0-9]+)/);
-            if (match && match[1]) prefill = match[1].toUpperCase();
-          } catch (_e) {
-            // ignore
-          }
-          setIsRestoringSession(false);
-          await handleLoginSuccess(dbProfile, record.usernameLower, prefill);
-          return;
+        const result = await apiRequest<{ profile: UserProfile; usernameLower: string }>('/auth/me');
+        if (!cancelled) {
+          const prefill = `${window.location.search} ${window.location.hash}`.match(/join=([A-Za-z0-9]+)/)?.[1]?.toUpperCase();
+          await handleLoginSuccess(result.profile, result.usernameLower, prefill);
         }
-
-        // Stored session no longer valid -> drop it, fall back to manual login.
-        clearLoginSession();
-      } catch (_e) {
-        // Could not reach the database; leave the pointer in place and let the
-        // user log in manually (no data is lost either way).
-      }
-      if (!cancelled) setIsRestoringSession(false);
+      } catch (error: any) {
+        if (!cancelled && error.status !== 401) addToast('error', 'Verbindung zum Server fehlgeschlagen. Bitte die Seite erneut laden.');
+      } finally { if (!cancelled) setIsRestoringSession(false); }
     };
-
     restore();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; };
   }, []);
 
   // Global Auth state
@@ -166,45 +129,18 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Load user sessions list from storage (thorough scan to ensure zero data loss)
-  const loadUserSessions = useCallback(
-    async (userLower: string, sessionCodes: string[]): Promise<SessionMeta[]> => {
-      const loadedMap = new Map<string, SessionMeta>();
+  const loadUserSessions = useCallback(async (): Promise<SessionMeta[]> => {
+    return (await apiRequest<{ groups: SessionMeta[] }>('/groups')).groups;
+  }, []);
 
-      // 1. Load by explicit session codes from user profile
-      for (const code of sessionCodes || []) {
-        try {
-          const session = await storageGet<SessionMeta>(`session:${code}:meta`);
-          if (session && session.code) {
-            loadedMap.set(session.code, session);
-          }
-        } catch (_e) {
-          // ignore missing
-        }
-      }
-
-      // 2. Discover any other session where the user is an active member.
-      //    Performance: one batch read of all session meta records instead of a
-      //    separate request per session.
-      try {
-        const metas = await storageGetMany('session:', ':meta');
-        for (const [key, session] of Object.entries(metas)) {
-          if (!key.endsWith(':meta')) continue;
-          const meta = session as SessionMeta;
-          if (!meta || !meta.code || loadedMap.has(meta.code)) continue;
-          const isMember = meta.members?.some(
-            (m) => m.user.toLowerCase() === userLower.toLowerCase() && m.active
-          );
-          if (isMember) loadedMap.set(meta.code, meta);
-        }
-      } catch (_e) {
-        // ignore scan errors
-      }
-
-      return Array.from(loadedMap.values());
-    },
-    []
-  );
+  const openGroups = async () => {
+    try {
+      const sessions = await loadUserSessions();
+      setUserSessions(sessions);
+      setPrefillJoinCode(undefined);
+      setShowSessionModal(true);
+    } catch (error: any) { addToast('error', 'Gruppen konnten nicht geladen werden: ' + error.message); }
+  };
 
   // Automatic Idempotent Settlement for Past Weeks (Section 6.3 & 7.2).
   // Works entirely off an already-loaded snapshot of the session subtree, so it
@@ -421,38 +357,19 @@ export default function App() {
     userLower: string,
     prefillCode?: string
   ) => {
-    // Guarantee a permanent user_id. Legacy accounts created before this field
-    // existed get one assigned once and persisted back to the database.
-    const { profile: ensuredProfile, changed } = ensureUserId(profile);
-    if (changed) {
-      try {
-        await storageSet(`user:${userLower}`, ensuredProfile);
-      } catch (_e) {
-        // Non-fatal: keep the id in memory for this session; retried next login.
-      }
-    }
-
-    setCurrentUser(ensuredProfile);
-    setUsernameLower(userLower);
-    setPrefillJoinCode(prefillCode);
-
-    // Persist a supporting login-session pointer on this device so a returning
-    // user is auto-recognised. The database stays the source of truth.
-    saveLoginSession(ensuredProfile, userLower);
-
     setIsLoadingSession(true);
     try {
-      const sessions = await loadUserSessions(userLower, ensuredProfile.sessions || []);
+      const sessions = await loadUserSessions();
+      setCurrentUser({ ...profile, sessions: sessions.map(s => s.code) });
+      setUsernameLower(userLower);
+      setPrefillJoinCode(prefillCode);
       setUserSessions(sessions);
 
       if (prefillCode) {
-        // User clicked invite link
-        const targetSession = await storageGet<SessionMeta>(`session:${prefillCode}:meta`);
-        if (targetSession) {
-          setShowSessionModal(true);
-        } else if (sessions.length > 0) {
-          setCurrentSession(sessions[0]);
-          await refreshSessionData(sessions[0], userLower);
+        const existing = sessions.find(s => s.code === prefillCode);
+        if (existing) {
+          setCurrentSession(existing);
+          await refreshSessionData(existing, userLower);
         } else {
           setShowSessionModal(true);
         }
@@ -929,53 +846,6 @@ export default function App() {
     setPaymentHistory(debtsStore.history);
   };
 
-  // Helper to seed Section 7.4 Demo Group
-  const handleSeedDemoGroup = async () => {
-    if (!currentUser || !usernameLower) return;
-    const demoCode = 'DEMO74';
-    const aliMember = { user: 'ali', displayName: 'Ali', joinedAt: new Date().toISOString(), penaltyCents: 500, active: true };
-    const beaMember = { user: 'bea', displayName: 'Bea', joinedAt: new Date().toISOString(), penaltyCents: 1000, active: true };
-    const cemMember = { user: 'cem', displayName: 'Cem', joinedAt: new Date().toISOString(), penaltyCents: 500, active: true };
-
-    const demoSession: SessionMeta = {
-      code: demoCode,
-      name: 'Gym Beasts (7.4 Demo)',
-      createdAt: new Date().toISOString(),
-      adminUser: 'ali',
-      members: [aliMember, beaMember, cemMember],
-      settings: { allowMultiplePerDay: false },
-    };
-
-    await storageSet(`session:${demoCode}:meta`, demoSession);
-
-    // Seed previous week data: Ali (3/3), Bea (0/2), Cem (3/4)
-    const prevWeek = getPreviousBerlinISOWeek(currentWeekKey);
-    await storageSet(`session:${demoCode}:week:${prevWeek}:user:ali`, {
-      goal: 3,
-      checks: [{ timestamp: new Date().toISOString() }, { timestamp: new Date().toISOString() }, { timestamp: new Date().toISOString() }],
-      penaltyCentsSnapshot: 500,
-    });
-    await storageSet(`session:${demoCode}:week:${prevWeek}:user:bea`, {
-      goal: 2,
-      checks: [],
-      penaltyCentsSnapshot: 1000,
-    });
-    await storageSet(`session:${demoCode}:week:${prevWeek}:user:cem`, {
-      goal: 4,
-      checks: [{ timestamp: new Date().toISOString() }, { timestamp: new Date().toISOString() }, { timestamp: new Date().toISOString() }],
-      penaltyCentsSnapshot: 500,
-    });
-
-    // Add to user sessions
-    const updated = Array.from(new Set([...(currentUser.sessions || []), demoCode]));
-    await storageSet(`user:${usernameLower}`, { ...currentUser, sessions: updated });
-
-    setCurrentSession(demoSession);
-    setUserSessions((prev) => [...prev.filter((s) => s.code !== demoCode), demoSession]);
-    await refreshSessionData(demoSession, usernameLower);
-    addToast('success', '7.4 Demo-Gruppe mit Ali, Bea & Cem geladen!');
-  };
-
   // While restoring a persisted login session, show a loader instead of
   // briefly flashing the login screen.
   if (isRestoringSession && (!currentUser || !usernameLower)) {
@@ -1027,7 +897,7 @@ export default function App() {
           currentUser={currentUser}
           onRefresh={() => refreshSessionData(currentSession, usernameLower)}
           isRefreshing={isRefreshing}
-          onSwitchSession={() => setShowSessionModal(true)}
+          onSwitchSession={openGroups}
           openDebtsCount={openDebts.filter((d) => d.status !== 'paid').length}
           weekBadgeCount={pendingExceptionsForMe}
         />
@@ -1112,10 +982,9 @@ export default function App() {
                 onRunKassenabschluss={handleRunKassenabschluss}
                 onLeaveSession={handleLeaveSession}
                 onDeleteSession={handleDeleteSession}
-                onSwitchSession={() => setShowSessionModal(true)}
+                onSwitchSession={openGroups}
                 onError={(msg) => addToast('error', msg)}
                 onSuccess={(msg) => addToast('success', msg)}
-                onSeedDemoGroup={handleSeedDemoGroup}
               />
             )}
           </>
@@ -1131,7 +1000,7 @@ export default function App() {
           currentUser={currentUser}
           onRefresh={() => refreshSessionData(currentSession, usernameLower)}
           isRefreshing={isRefreshing}
-          onSwitchSession={() => setShowSessionModal(true)}
+          onSwitchSession={openGroups}
           openDebtsCount={openDebts.filter((d) => d.status !== 'paid').length}
           weekBadgeCount={pendingExceptionsForMe}
         />
@@ -1158,13 +1027,15 @@ export default function App() {
             addToast('success', `Session „${s.name}“ geöffnet!`);
           }}
           onError={(msg) => addToast('error', msg)}
-          onLogout={() => {
-            clearLoginSession();
+          onLogout={async () => {
+            try { await apiRequest('/auth/logout', {}); }
+            catch { addToast('error', 'Abmelden fehlgeschlagen. Bitte erneut versuchen.'); return; }
             setCurrentUser(null);
             setUsernameLower('');
             setCurrentSession(null);
             setShowSessionModal(false);
             setUserSessions([]);
+            setPrefillJoinCode(undefined);
           }}
         />
       )}
