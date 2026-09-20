@@ -174,37 +174,16 @@ export default function App() {
 
   // Load user sessions list from storage (thorough scan to ensure zero data loss)
   const loadUserSessions = useCallback(
-    async (userLower: string, sessionCodes: string[]): Promise<SessionMeta[]> => {
+    async (userLower: string): Promise<SessionMeta[]> => {
       const loadedMap = new Map<string, SessionMeta>();
 
-      // 1. Load by explicit session codes from user profile
-      for (const code of sessionCodes || []) {
-        try {
-          const session = await storageGet<SessionMeta>(`session:${code}:meta`);
-          if (session && session.code) {
-            loadedMap.set(session.code, session);
-          }
-        } catch (_e) {
-          // ignore missing
-        }
-      }
-
-      // 2. Discover any other session where the user is an active member.
-      //    Performance: one batch read of all session meta records instead of a
-      //    separate request per session.
-      try {
-        const metas = await storageGetMany('session:', ':meta');
-        for (const [key, session] of Object.entries(metas)) {
-          if (!key.endsWith(':meta')) continue;
-          const meta = session as SessionMeta;
-          if (!meta || !meta.code || loadedMap.has(meta.code)) continue;
-          const isMember = meta.members?.some(
-            (m) => m.user.toLowerCase() === userLower.toLowerCase() && m.active
-          );
-          if (isMember) loadedMap.set(meta.code, meta);
-        }
-      } catch (_e) {
-        // ignore scan errors
+      // Group membership is authoritative, not a stale profile's list of codes.
+      const metas = await storageGetMany('session:', ':meta');
+      for (const [key, value] of Object.entries(metas)) {
+        const meta = value as SessionMeta;
+        if (key.endsWith(':meta') && meta?.code && meta.members?.some(m =>
+          m.active && m.user.toLowerCase() === userLower.toLowerCase()
+        )) loadedMap.set(meta.code, meta);
       }
 
       return Array.from(loadedMap.values());
@@ -287,6 +266,9 @@ export default function App() {
     [currentWeekKey]
   );
 
+  const refreshSequence = useRef(0);
+  const ownWriteVersion = useRef(0);
+
   // Freshly load all data for the active session.
   // Performance: the entire session subtree is fetched in ONE batch request and
   // everything below is derived locally (previously dozens of sequential round
@@ -297,11 +279,14 @@ export default function App() {
     async (session: SessionMeta, userLower: string, silent = false) => {
       if (!silent) setIsRefreshing(true);
       const code = session.code;
+      const sequence = ++refreshSequence.current;
+      const writeVersion = ownWriteVersion.current;
 
       try {
         // 1. One batch read of the whole session subtree.
         const all = await storageGetMany(`session:${code}:`);
 
+        if (sequence !== refreshSequence.current) return;
         const freshSession = (all[`session:${code}:meta`] as SessionMeta) || session;
         setCurrentSession(freshSession);
 
@@ -316,6 +301,8 @@ export default function App() {
             console.warn('Past-week settlement skipped:', settleErr);
           }
         }
+
+        if (sequence !== refreshSequence.current) return;
 
         // 3. All members' data for the current week (from the snapshot).
         const membersMap: Record<string, UserWeekData> = {};
@@ -337,7 +324,7 @@ export default function App() {
         // keep the local copy of THEIR data so a concurrent auto-sync refresh can
         // never roll back their own edit. Other members' data is always taken
         // fresh from the database.
-        if (pendingMyWriteRef.current > 0 && myWeekDataRef.current) {
+        if ((pendingMyWriteRef.current > 0 || writeVersion !== ownWriteVersion.current) && myWeekDataRef.current) {
           membersMap[userLower] = myWeekDataRef.current;
         }
         setAllMembersCurrentWeek(membersMap);
@@ -385,7 +372,7 @@ export default function App() {
           );
         }
       } finally {
-        if (!silent) setIsRefreshing(false);
+        if (sequence === refreshSequence.current) setIsRefreshing(false);
       }
     },
     [currentWeekKey, nextWeekKey, checkAndRunPastSettlements]
@@ -411,7 +398,7 @@ export default function App() {
         if (
           changedKey === '__RESET__' ||
           changedKey.startsWith(`session:${sessionCode}:`) ||
-          changedKey.startsWith(`user:${usernameLowerRef.current}`)
+          changedKey === `user:${usernameLowerRef.current}`
         ) {
           if (debounceTimer) clearTimeout(debounceTimer);
           debounceTimer = setTimeout(() => {
@@ -425,6 +412,10 @@ export default function App() {
       },
       (connected) => {
         setIsLiveConnected(connected);
+        // Re-read after reconnect: events sent while disconnected are not replayed.
+        const activeSession = currentSessionRef.current;
+        const user = usernameLowerRef.current;
+        if (connected && activeSession && user) refreshRef.current?.(activeSession, user, true).catch(() => {});
       }
     );
 
@@ -434,20 +425,23 @@ export default function App() {
     };
   }, [currentSession?.code, usernameLower]);
 
-  // Fast auto-sync fallback: poll every 3.5 seconds and on focus / tab visibility,
+  // Fast auto-sync fallback: poll every 15 seconds and on focus / tab visibility,
   // ensuring full data synchronization even if an SSE connection is dropped or throttled.
   useEffect(() => {
     if (!currentSession?.code || !usernameLower) return;
+    let pending = false;
     const doSync = () => {
+      if (pending) return;
       if (typeof document !== 'undefined' && document.hidden) return;
       const fn = refreshRef.current;
       const activeSession = currentSessionRef.current;
       const uLower = usernameLowerRef.current;
       if (fn && activeSession && uLower) {
-        fn(activeSession, uLower, true).catch(() => {});
+        pending = true;
+        fn(activeSession, uLower, true).catch(() => {}).finally(() => { pending = false; });
       }
     };
-    const interval = window.setInterval(doSync, 3500);
+    const interval = window.setInterval(doSync, 15000);
     const onVisibility = () => {
       if (typeof document !== 'undefined' && !document.hidden) doSync();
     };
@@ -487,7 +481,7 @@ export default function App() {
 
     setIsLoadingSession(true);
     try {
-      const sessions = await loadUserSessions(userLower, ensuredProfile.sessions || []);
+      const sessions = await loadUserSessions(userLower);
       setUserSessions(sessions);
 
       if (prefillCode) {
@@ -509,6 +503,8 @@ export default function App() {
         setShowSessionModal(true);
       }
     } catch (e: any) {
+      setCurrentUser(null);
+      setUsernameLower('');
       addToast('error', 'Fehler beim Laden der Gruppen: ' + e?.message);
     } finally {
       setIsLoadingSession(false);
@@ -518,6 +514,7 @@ export default function App() {
   // Update my week data
   const handleUpdateMyWeekData = async (weekKey: string, updated: UserWeekData) => {
     if (!currentSession || !usernameLower) return;
+    ownWriteVersion.current++;
     const storageKey = `session:${currentSession.code}:week:${weekKey}:user:${usernameLower}`;
 
     // Optimistically reflect the edit and mark a write in flight so a concurrent
@@ -1208,6 +1205,7 @@ export default function App() {
           }}
           onError={(msg) => addToast('error', msg)}
           onLogout={() => {
+            refreshSequence.current++;
             clearLoginSession();
             setCurrentUser(null);
             setUsernameLower('');

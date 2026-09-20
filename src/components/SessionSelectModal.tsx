@@ -154,7 +154,11 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
         if (changed) {
           await storageSet(`session:${cleanCode}:meta`, session);
         }
-        onSelectSession(session);
+        // Repair the profile index when an existing member joins from another device.
+        await storageSet(`user:${usernameLower}`, {
+          ...currentUser, sessions: Array.from(new Set([...(currentUser.sessions || []), cleanCode])),
+        });
+        onSessionCreatedOrJoined(session);
         setIsLoading(false);
         return;
       }

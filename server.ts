@@ -1,52 +1,19 @@
 import express from 'express';
 import path from 'path';
-import fs from 'fs';
+import 'dotenv/config';
+import { FileStore } from './server/store.ts';
+import { StorageStream } from './server/stream.ts';
 import { createServer as createViteServer } from 'vite';
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 app.use(express.json({ limit: '10mb' }));
 
-// Set of active SSE client connections for real-time synchronization
-const sseClients = new Set<express.Response>();
-
-function notifyStorageChange(key: string, value: string) {
-  if (sseClients.size === 0) return;
-  const payload = JSON.stringify({ key, value, ts: Date.now() });
-  const deadClients: express.Response[] = [];
-  for (const client of sseClients) {
-    try {
-      client.write(`event: storage_change\ndata: ${payload}\n\n`);
-    } catch (_e) {
-      deadClients.push(client);
-    }
-  }
-  for (const dead of deadClients) {
-    sseClients.delete(dead);
-  }
-}
-
-// In-memory + persistent file storage for shared key-value store
-const DATA_FILE = path.join(process.cwd(), '.storage_data.json');
-let memoryStore: Record<string, string> = {};
-
-// Load persisted data if available
-try {
-  if (fs.existsSync(DATA_FILE)) {
-    const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-    memoryStore = JSON.parse(raw);
-  }
-} catch (e) {
-  console.warn('Could not read existing storage file, starting fresh:', e);
-}
-
-function saveStore() {
-  try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(memoryStore, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('Failed to persist store:', e);
-  }
+const store = new FileStore(process.env.STORAGE_DATA_FILE || path.join(process.cwd(), '.storage_data.json'));
+const stream = new StorageStream();
+if (process.env.K_SERVICE && !process.env.STORAGE_DATA_FILE) {
+  console.warn('Cloud Run: local storage is ephemeral. Configure a durable data backend before relying on this deployment.');
 }
 
 // Ensure NO intermediate caching or browser heuristic caching for any storage API
@@ -65,33 +32,17 @@ app.get('/api/storage/stream', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  res.write(`event: connected\ndata: {"status":"connected","serverTime":${Date.now()}}\n\n`);
-  sseClients.add(res);
-
-  // Keep-alive heartbeat ping every 20 seconds to prevent proxy / container timeouts
-  const keepAlive = setInterval(() => {
-    try {
-      res.write(`event: ping\ndata: {}\n\n`);
-    } catch (_e) {
-      clearInterval(keepAlive);
-      sseClients.delete(res);
-    }
-  }, 20000);
-
-  req.on('close', () => {
-    clearInterval(keepAlive);
-    sseClients.delete(res);
-  });
+  stream.add(res);
 });
 
 // REST API for window.storage shared persistence
 app.get('/api/storage/get', (req, res) => {
   const key = req.query.key as string;
-  if (!key) {
+  if (typeof key !== 'string' || !key || key.length > 512) {
     return res.status(400).json({ error: 'Key is required' });
   }
-  if (Object.prototype.hasOwnProperty.call(memoryStore, key)) {
-    return res.json({ key, value: memoryStore[key] });
+  if (store.get(key) !== undefined) {
+    return res.json({ key, value: store.get(key) });
   } else {
     return res.status(404).json({ error: `Key not found: ${key}` });
   }
@@ -99,13 +50,12 @@ app.get('/api/storage/get', (req, res) => {
 
 app.post('/api/storage/set', (req, res) => {
   const { key, value } = req.body;
-  if (!key || typeof value === 'undefined') {
+  if (typeof key !== 'string' || !key || key.length > 512 || typeof value === 'undefined') {
     return res.status(400).json({ error: 'Key and value are required' });
   }
   const stringValue = typeof value === 'string' ? value : JSON.stringify(value);
-  memoryStore[key] = stringValue;
-  saveStore();
-  notifyStorageChange(key, stringValue);
+  store.set(key, stringValue);
+  stream.notify(key);
   return res.json({ success: true, key });
 });
 
@@ -114,40 +64,36 @@ app.post('/api/storage/set', (req, res) => {
 app.get('/api/storage/entries', (req, res) => {
   const prefix = (req.query.prefix as string) || '';
   const suffix = (req.query.suffix as string) || '';
-  const entries: Record<string, string> = {};
-  for (const k of Object.keys(memoryStore)) {
-    if (k.startsWith(prefix) && (!suffix || k.endsWith(suffix))) entries[k] = memoryStore[k];
-  }
+  const entries = store.entries(prefix, suffix);
   return res.json({ entries });
 });
 
 app.get('/api/storage/list', (req, res) => {
   const prefix = (req.query.prefix as string) || '';
-  const matchedKeys = Object.keys(memoryStore).filter((k) => k.startsWith(prefix));
+  const matchedKeys = Object.keys(store.entries(prefix));
   return res.json({ keys: matchedKeys });
 });
 
 app.delete('/api/storage/delete', (req, res) => {
   const key = req.query.key as string;
-  if (!key) {
+  if (typeof key !== 'string' || !key || key.length > 512) {
     return res.status(400).json({ error: 'Key is required' });
   }
-  if (Object.prototype.hasOwnProperty.call(memoryStore, key)) {
-    delete memoryStore[key];
-    saveStore();
-    notifyStorageChange(key, '__DELETED__');
+  if (store.get(key) !== undefined) {
+    store.delete(key);
+    stream.notify(key);
     return res.json({ success: true, deleted: key });
   } else {
     return res.status(404).json({ error: `Key not found: ${key}` });
   }
 });
 
-app.post('/api/storage/reset-demo', (_req, res) => {
-  // Clear or seed demo data
-  memoryStore = {};
-  saveStore();
-  notifyStorageChange('__RESET__', '');
-  return res.json({ success: true });
+// The previous public reset endpoint could erase every real user's records.
+app.post('/api/storage/reset-demo', (_req, res) => res.status(403).json({ error: 'Global reset is disabled.' }));
+app.use('/api', (_req, res) => res.status(404).json({ error: 'Unknown API endpoint' }));
+app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('Storage request failed:', error.message);
+  res.status(error.status || 500).json({ error: 'Daten konnten nicht geladen oder gespeichert werden. Bitte erneut versuchen.' });
 });
 
 async function startServer() {
