@@ -35,7 +35,7 @@ import {
   WorkoutCheck,
   ExceptionRequest,
 } from '../types.ts';
-import { EXCEPTION_REASONS, statusLabel, hasActiveWeekException, hasApprovedWeekException } from '../lib/exceptions.ts';
+import { EXCEPTION_REASONS, statusLabel, getWeekUnits, exceptionUnitLabel, hasActiveWeekException, hasApprovedWeekException } from '../lib/exceptions.ts';
 import {
   getBerlinParts,
   getWeekDateRange,
@@ -66,7 +66,8 @@ interface ThisWeekViewProps {
   onRequestException: (
     reasonCode?: string,
     reasonLabel?: string,
-    kind?: 'single' | 'week'
+    kind?: 'single' | 'week',
+    unitIndices?: number[]
   ) => Promise<void> | void;
   onDecideException: (request: ExceptionRequest, approve: boolean) => Promise<void> | void;
   onError: (msg: string) => void;
@@ -113,7 +114,8 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
   const checksCount = myCurrentWeekData.checks.length;
 
   // Excused units (approved exceptions) count as neither done nor missed.
-  const myApprovedExcused = excusedByUser[usernameLower] || 0;
+  const units = getWeekUnits(currentGoal, myCurrentWeekData.checks, weekExceptions, usernameLower);
+  const myApprovedExcused = units.filter(u => u.status === 'excused').length;
   const excusedForRender = Math.min(myApprovedExcused, Math.max(0, currentGoal - checksCount));
   const missedUnits = Math.max(0, currentGoal - checksCount - excusedForRender);
   const potentialPenalty = missedUnits * (myCurrentWeekData.penaltyCentsSnapshot || currentPenaltyCents);
@@ -121,9 +123,6 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
   // Exception ("Ausnahme") derivations for the current user & partner.
   const myRequests = weekExceptions.filter((e) => e.requester.toLowerCase() === usernameLower);
   const myPendingRequests = myRequests.filter((e) => e.status === 'pending');
-  const myActiveExceptionCount = myRequests.filter(
-    (e) => e.status === 'pending' || e.status === 'approved'
-  ).length;
   // Requests from partners that are still waiting for MY decision.
   const incomingPending = weekExceptions.filter(
     (e) => e.status === 'pending' && e.requester.toLowerCase() !== usernameLower
@@ -133,14 +132,16 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
   );
   const weekDropoutActive = hasActiveWeekException(weekExceptions, usernameLower);
   const weekDropoutApproved = hasApprovedWeekException(weekExceptions, usernameLower);
-  const openForRequest = currentGoal - checksCount - myActiveExceptionCount;
+  const openForRequest = units.filter(u => u.status === 'open').length;
   // A running emergency dropout already covers the rest of the week.
   const canRequestException =
-    currentGoal > 0 && openForRequest > 0 && hasOtherActiveMember && !weekDropoutActive;
+    !myCurrentWeekData.lockedAt && currentGoal > 0 && openForRequest > 0 && hasOtherActiveMember && !weekDropoutActive;
   const canRequestWeekDropout =
-    currentGoal > 0 && currentGoal - checksCount > 0 && hasOtherActiveMember && !weekDropoutActive;
+    !myCurrentWeekData.lockedAt && currentGoal > 0 && currentGoal - checksCount > 0 && hasOtherActiveMember && !weekDropoutActive;
 
   // Inline reason picker state for requesting an exception.
+  const [selectedUnits, setSelectedUnits] = useState<number[]>([]);
+  const [requestError, setRequestError] = useState('');
   const [showReasonPicker, setShowReasonPicker] = useState<boolean>(false);
   const [selectedReason, setSelectedReason] = useState<string>('krank');
   const [customReason, setCustomReason] = useState<string>('');
@@ -155,13 +156,18 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
       selectedReason === 'anderer' && customReason.trim()
         ? customReason.trim().slice(0, 80)
         : opt?.label;
+    if (isSubmittingException) return;
+    setRequestError('');
     setIsSubmittingException(true);
     try {
-      await onRequestException(selectedReason, label, pickerKind);
+      await onRequestException(selectedReason, label, pickerKind, selectedUnits);
       setShowReasonPicker(false);
       setCustomReason('');
       setSelectedReason('krank');
       setPickerKind('single');
+      setSelectedUnits([]);
+    } catch (error: any) {
+      setRequestError(error.message || 'Anfrage fehlgeschlagen. Bitte erneut versuchen.');
     } finally {
       setIsSubmittingException(false);
     }
@@ -182,7 +188,9 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
       onError('Diese Woche ist abgeschlossen und kann nicht mehr geändert werden.');
       return;
     }
-    const currentChecks = [...myCurrentWeekData.checks];
+    const currentChecks = myCurrentWeekData.checks.map((check, index) => ({
+      ...check, unitIndex: units.findIndex(u => u.checkIndex === index),
+    }));
     if (checkIndex < 0 || checkIndex >= currentChecks.length) return;
     currentChecks.splice(checkIndex, 1);
     await onUpdateMyWeekData(currentWeekKey, { ...myCurrentWeekData, checks: currentChecks });
@@ -204,7 +212,12 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
       return;
     }
 
-    const currentChecks = [...myCurrentWeekData.checks, { timestamp: new Date().toISOString() } as WorkoutCheck];
+    const unitIndex = units.findIndex(u => u.status === 'open' || u.status === 'pending');
+    if (unitIndex < 0) return;
+    const currentChecks = [
+      ...myCurrentWeekData.checks.map((check, index) => ({ ...check, unitIndex: units.findIndex(u => u.checkIndex === index) })),
+      { timestamp: new Date().toISOString(), unitIndex } as WorkoutCheck,
+    ];
     await onUpdateMyWeekData(currentWeekKey, { ...myCurrentWeekData, checks: currentChecks });
 
     if (currentChecks.length + excusedForRender >= currentGoal && currentGoal > 0) {
@@ -312,14 +325,15 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
           <div className="relative z-10 flex flex-col gap-4">
             <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-6 py-4">
               {Array.from({ length: currentGoal }).map((_, idx) => {
-                const isChecked = idx < checksCount;
-                const isExcused = idx >= checksCount && idx < checksCount + excusedForRender;
-                const firstOpenIdx = checksCount + excusedForRender;
+                const isChecked = units[idx].status === 'done';
+                const isExcused = units[idx].status === 'excused';
+                const isPending = units[idx].status === 'pending';
+                const firstOpenIdx = units.findIndex(u => u.status === 'open' || u.status === 'pending');
                 const isNextToCheck = idx === firstOpenIdx;
-                const checkData = isChecked ? myCurrentWeekData.checks[idx] : null;
+                const checkData = isChecked ? myCurrentWeekData.checks[units[idx].checkIndex!] : null;
 
                 const handleClick = () => {
-                  if (isChecked) removeCheckAt(idx);
+                  if (isChecked) removeCheckAt(units[idx].checkIndex!);
                   else if (isExcused)
                     onError('Dieser Sporttag ist entschuldigt (genehmigte Ausnahme).');
                   else if (isNextToCheck) addCheck();
@@ -331,7 +345,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                     type="button"
                     id={`workout-circle-${idx}`}
                     aria-label={`Einheit ${idx + 1} von ${currentGoal}, ${
-                      isChecked ? 'erledigt' : isExcused ? 'entschuldigt' : 'nicht erledigt'
+                      isChecked ? 'erledigt' : isExcused ? 'entschuldigt' : isPending ? 'Entschuldigung angefragt' : 'nicht erledigt'
                     }`}
                     onClick={handleClick}
                     className={`relative w-20 h-20 sm:w-22 sm:h-22 rounded-full flex flex-col items-center justify-center transition-all cursor-pointer select-none active:scale-95 ${
@@ -352,6 +366,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                       <span className="text-lg font-black font-mono">{idx + 1}</span>
                     )}
 
+                    {isPending && <span className="text-[9px] text-amber-300">Angefragt</span>}
                     {isChecked && checkData && (
                       <span className="text-[9px] font-black font-mono text-black/80 -mt-1 tracking-tight">
                         {formatBerlinDate(checkData.timestamp)}
@@ -409,7 +424,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                 <Clock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                 <p className="leading-relaxed">
                   <strong className="text-amber-300">
-                    {req.kind === 'week' ? 'Notfall-Ausfall' : 'Ausnahme'} angefragt
+                    {exceptionUnitLabel(req)} angefragt
                     {req.reasonLabel ? ` (${req.reasonLabel})` : ''}.
                   </strong>{' '}
                   Wartet auf Zustimmung deines Partners.
@@ -436,12 +451,14 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                     id="request-exception-btn"
                     onClick={() => {
                       setPickerKind('single');
+                      setSelectedUnits([]);
+                      setRequestError('');
                       setShowReasonPicker(true);
                     }}
                     className="w-full min-h-[44px] py-2.5 px-4 bg-white/5 hover:bg-amber-400/10 border border-amber-400/30 hover:border-amber-400/60 text-amber-200 font-black uppercase tracking-wider rounded-2xl text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
                   >
                     <CalendarX className="w-4 h-4" />
-                    Sporttag ausnahmsweise auslassen
+                    Einheiten entschuldigen
                   </button>
                 )}
                 {canRequestWeekDropout && (
@@ -450,6 +467,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                     id="request-week-dropout-btn"
                     onClick={() => {
                       setPickerKind('week');
+                      setRequestError('');
                       setShowReasonPicker(true);
                     }}
                     className="w-full min-h-[44px] py-2.5 px-4 bg-red-500/10 hover:bg-red-500/20 border border-red-500/40 hover:border-red-500/70 text-red-200 font-black uppercase tracking-wider rounded-2xl text-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
@@ -467,6 +485,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                   </span>
                   <button
                     type="button"
+                    disabled={isSubmittingException}
                     onClick={() => setShowReasonPicker(false)}
                     className="text-white/40 hover:text-white cursor-pointer"
                     aria-label="Abbrechen"
@@ -474,6 +493,22 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                     <X className="w-4 h-4" />
                   </button>
                 </div>
+                {pickerKind === 'single' && (
+                  <fieldset disabled={isSubmittingException} className="flex flex-col gap-3">
+                    <legend className="text-sm font-bold mb-2">Welche Einheiten möchtest du entschuldigen?</legend>
+                    <p className="text-xs text-white/60">Wähle eine oder mehrere offene Einheiten dieser Woche. Erst nach Zustimmung eines anderen Mitglieds entfallen die Strafen.</p>
+                    <div className="grid grid-cols-2 gap-2">
+                      {units.map((unit, index) => (
+                        <label key={index} className={`flex items-center gap-2 p-3 rounded-xl border ${unit.status === 'open' ? 'border-amber-400/40 cursor-pointer' : 'border-white/10 opacity-50'}`}>
+                          <input type="checkbox" aria-label={`Einheit ${index + 1} entschuldigen`} disabled={unit.status !== 'open'} checked={unit.status === 'open' && selectedUnits.includes(index)}
+                            onChange={e => setSelectedUnits(prev => e.target.checked ? [...prev, index] : prev.filter(i => i !== index))} className="accent-amber-400" />
+                          <span className="text-xs">Einheit {index + 1}<span className="block text-white/50">{unit.status === 'done' ? 'Erledigt' : unit.status === 'excused' ? 'Entschuldigt' : unit.status === 'pending' ? 'Angefragt' : 'Offen'}</span></span>
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                )}
+                {requestError && <p role="alert" className="text-sm text-red-300">{requestError}</p>}
                 <div className="flex flex-wrap gap-2">
                   {EXCEPTION_REASONS.map((r) => (
                     <button
@@ -508,7 +543,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                 <button
                   type="button"
                   id="submit-exception-btn"
-                  disabled={isSubmittingException}
+                  disabled={isSubmittingException || (pickerKind === 'single' && !selectedUnits.length)}
                   onClick={submitException}
                   className="w-full min-h-[44px] py-2.5 px-4 bg-amber-400 hover:scale-[1.02] active:scale-95 text-black font-black uppercase tracking-wider rounded-2xl text-xs transition-all disabled:opacity-40 flex items-center justify-center gap-2 cursor-pointer shadow-lg"
                 >
@@ -543,7 +578,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                 </div>
                 <div className="flex flex-col min-w-0">
                   <h3 className="text-sm font-black uppercase tracking-tight text-white">
-                    {req.kind === 'week' ? 'Notfall-Ausfall-Anfrage' : 'Ausnahme-Anfrage'}
+                    {exceptionUnitLabel(req)} – Entschuldigung angefragt
                   </h3>
                   <p className="text-xs text-white/70 leading-relaxed mt-0.5">
                     <strong className="text-amber-200">{req.requesterDisplayName}</strong>{' '}
@@ -785,8 +820,9 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                     {goal > 0 ? (
                       <div className="flex items-center gap-1">
                         {Array.from({ length: Math.min(goal, 7) }).map((_, cIdx) => {
-                          const isDone = cIdx < completed;
-                          const isExc = !isDone && cIdx < completed + memberExcused;
+                          const memberUnits = getWeekUnits(goal, memberData.checks || [], weekExceptions, memberLower);
+                          const isDone = memberUnits[cIdx]?.status === 'done';
+                          const isExc = memberUnits[cIdx]?.status === 'excused';
                           return (
                             <span
                               key={cIdx}
@@ -842,7 +878,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
                     <span className="text-white/80 min-w-0 truncate">
                       <strong className="text-white">{req.requesterDisplayName}</strong>
                       <span className="text-white/50">
-                        {' '}— {req.kind === 'week' ? 'Notfall-Ausfall' : 'Sporttag'}
+                        {' '}— {exceptionUnitLabel(req)}
                         {req.reasonLabel ? ` (${req.reasonLabel})` : ''}
                       </span>
                     </span>

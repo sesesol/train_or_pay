@@ -32,7 +32,9 @@ import {
   loadWeekExceptions,
   computeExcusedFor,
   buildExcusedMap,
-  countActiveExceptions,
+  getWeekUnits,
+  validateSelectedUnits,
+  exceptionUnitLabel,
   hasActiveWeekException,
   nextSlotForUser,
   exceptionKey,
@@ -236,7 +238,7 @@ export default function App() {
             completed,
             penaltyCents: uData?.penaltyCentsSnapshot || member.penaltyCents,
             joinedMidWeek: uData?.joinedMidWeek || false,
-            excused: computeExcusedFor(pastExceptions, mLower, goal, completed),
+            excused: computeExcusedFor(pastExceptions, mLower, goal, completed, uData?.checks || []),
           };
         });
 
@@ -545,91 +547,35 @@ export default function App() {
   const handleRequestException = async (
     reasonCode?: string,
     reasonLabel?: string,
-    kind: 'single' | 'week' = 'single'
+    kind: 'single' | 'week' = 'single',
+    unitIndices: number[] = []
   ) => {
-    if (!currentSession || !usernameLower || !currentUser) return;
+    if (!currentSession || !usernameLower || !currentUser) throw new Error('Bitte zuerst eine Gruppe öffnen.');
     const code = currentSession.code;
-
-    // Permission: only an active member of THIS session may request.
-    const me = currentSession.members.find(
-      (m) => m.user.toLowerCase() === usernameLower && m.active
-    );
-    if (!me) {
-      addToast('error', 'Nur aktive Mitglieder dieser Gruppe können eine Ausnahme beantragen.');
-      return;
-    }
-
-    const myData = allMembersCurrentWeek[usernameLower] || myCurrentWeekData;
-    const goal = myData?.goal || 0;
-    const completed = myData?.checks?.length || 0;
-    if (goal <= 0) {
-      addToast('info', 'Diese Woche ist pausiert – es gibt keinen Sporttag zum Auslassen.');
-      return;
-    }
-
-    // There must be another active member who can decide (no self-approval).
-    const otherActive = currentSession.members.filter(
-      (m) => m.active && m.user.toLowerCase() !== usernameLower
-    );
-    if (otherActive.length === 0) {
-      addToast('error', 'Es gibt kein anderes Mitglied, das die Ausnahme genehmigen könnte.');
-      return;
-    }
-
-    try {
-      // Re-read fresh to avoid races and prevent contradictory/duplicate requests.
-      const fresh = await loadWeekExceptions(code, currentWeekKey);
-
-      // An emergency dropout already covers the whole rest of the week, so no
-      // further request of either kind may be stacked on top of it.
-      if (hasActiveWeekException(fresh, usernameLower)) {
-        addToast('info', 'Es läuft bereits ein Notfall-Ausfall für diese Woche.');
-        await refreshSessionData(currentSession, usernameLower);
-        return;
-      }
-
-      if (kind === 'week') {
-        // Emergency dropout: needs at least one open unit left to excuse.
-        if (goal - completed <= 0) {
-          addToast('info', 'Du hast diese Woche bereits alle Einheiten erledigt.');
-          await refreshSessionData(currentSession, usernameLower);
-          return;
-        }
-      } else {
-        const active = countActiveExceptions(fresh, usernameLower);
-        if (goal - completed - active <= 0) {
-          addToast('info', 'Für diese Woche sind keine offenen Sporttage mehr zum Auslassen vorhanden.');
-          await refreshSessionData(currentSession, usernameLower);
-          return;
-        }
-      }
-
-      const slot = nextSlotForUser(fresh, usernameLower);
-      const req: ExceptionRequest = {
-        id: `${currentWeekKey}:${usernameLower}:${slot}`,
-        sessionCode: code,
-        weekKey: currentWeekKey,
-        requester: usernameLower,
-        requesterId: currentUser.id,
-        requesterDisplayName: currentUser.displayName,
-        kind,
-        slot,
-        reasonCode,
-        reasonLabel,
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-      };
-      await storageSet(exceptionKey(code, currentWeekKey, usernameLower, slot), req);
-      addToast(
-        'success',
-        kind === 'week'
-          ? 'Notfall-Ausfall beantragt. Er wartet auf die Zustimmung deines Partners.'
-          : 'Ausnahme-Anfrage gesendet. Sie wartet auf die Zustimmung deines Partners.'
-      );
-      await refreshSessionData(currentSession, usernameLower);
-    } catch (e: any) {
-      addToast('error', 'Anfrage konnte nicht gespeichert werden: ' + (e?.message || ''));
-    }
+    if (currentWeekKey !== getBerlinISOWeek(new Date())) throw new Error('Die Woche hat gewechselt. Bitte die Seite neu laden.');
+    const session = await storageGet<SessionMeta>(`session:${code}:meta`);
+    if (!session?.members.some(m => m.active && m.user.toLowerCase() === usernameLower)) throw new Error('Nur aktive Mitglieder können eine Entschuldigung anfragen.');
+    if (!session.members.some(m => m.active && m.user.toLowerCase() !== usernameLower)) throw new Error('Es gibt kein anderes aktives Mitglied, das zustimmen kann.');
+    const data = await storageGet<UserWeekData>(`session:${code}:week:${currentWeekKey}:user:${usernameLower}`);
+    if (!data || data.goal <= 0 || data.lockedAt) throw new Error('Für diese Woche sind keine veränderbaren Einheiten vorhanden.');
+    const fresh = await loadWeekExceptions(code, currentWeekKey);
+    if (hasActiveWeekException(fresh, usernameLower)) throw new Error('Für die restliche Woche besteht bereits eine Anfrage oder Entschuldigung.');
+    const units = getWeekUnits(data.goal, data.checks || [], fresh, usernameLower);
+    const selected = kind === 'single' ? validateSelectedUnits(unitIndices, units) : [];
+    if (kind === 'week' && !units.some(u => u.status === 'open' || u.status === 'pending')) throw new Error('Alle Einheiten sind bereits erledigt oder entschuldigt.');
+    const slot = nextSlotForUser(fresh, usernameLower);
+    const request: ExceptionRequest = {
+      id: `${currentWeekKey}:${usernameLower}:${slot}`,
+      sessionCode: code, weekKey: currentWeekKey,
+      requester: usernameLower, requesterId: currentUser.id,
+      requesterDisplayName: currentUser.displayName,
+      kind, slot, ...(kind === 'single' ? { unitIndices: selected } : {}),
+      reasonCode, reasonLabel, status: 'pending', createdAt: new Date().toISOString(),
+    };
+    // All selected units are one request, so a failed write cannot save only half the selection.
+    await storageSet(exceptionKey(code, currentWeekKey, usernameLower, slot), request);
+    addToast('success', `${exceptionUnitLabel(request)} angefragt. Ein anderes Mitglied muss zustimmen.`);
+    await refreshSessionData(currentSession, usernameLower, true);
   };
 
   // Approve or reject an exception request. Only a partner (not the requester)
@@ -667,6 +613,23 @@ export default function App() {
         addToast('info', 'Diese Anfrage wurde bereits entschieden.');
         await refreshSessionData(currentSession, usernameLower);
         return;
+      }
+
+      const freshSession = await storageGet<SessionMeta>(`session:${code}:meta`);
+      if (freshReq.weekKey !== getBerlinISOWeek(new Date()) || freshReq.sessionCode !== code ||
+          freshReq.requester.toLowerCase() === usernameLower ||
+          !freshSession?.members.some(m => m.active && m.user.toLowerCase() === usernameLower) ||
+          !freshSession.members.some(m => m.active && m.user.toLowerCase() === freshReq.requester.toLowerCase())) {
+        throw new Error('Nur ein anderes aktives Mitglied darf Anfragen der aktuellen Woche bestätigen.');
+      }
+      const data = await storageGet<UserWeekData>(`session:${code}:week:${freshReq.weekKey}:user:${freshReq.requester.toLowerCase()}`);
+      if (!data || data.lockedAt) throw new Error('Diese Woche kann nicht mehr geändert werden.');
+      if (approve && freshReq.unitIndices) {
+        const requests = await loadWeekExceptions(code, freshReq.weekKey);
+        const units = getWeekUnits(data.goal, data.checks || [], requests.filter(r => r.id !== freshReq.id), freshReq.requester);
+        if (!freshReq.unitIndices.length || freshReq.unitIndices.some(i => !Number.isInteger(i) || units[i]?.status !== 'open')) {
+          throw new Error('Eine ausgewählte Einheit wurde inzwischen erledigt oder anderweitig angefragt. Bitte die Anfrage ablehnen und neu auswählen.');
+        }
       }
 
       const updated: ExceptionRequest = {
@@ -840,7 +803,8 @@ export default function App() {
           weekExc,
           mLower,
           uData ? uData.goal : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.goal ?? 0) : 0),
-          uData ? (uData.checks?.length || 0) : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.checks?.length || 0) : 0)
+          uData ? (uData.checks?.length || 0) : (weekKey === currentWeekKey ? (allMembersCurrentWeek[mLower]?.checks?.length || 0) : 0),
+          uData?.checks || (weekKey === currentWeekKey ? allMembersCurrentWeek[mLower]?.checks || [] : [])
         ),
       });
     }
