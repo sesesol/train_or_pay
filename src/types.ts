@@ -34,6 +34,7 @@ export interface SessionMeta {
 }
 
 export interface WorkoutCheck {
+  unitIndex?: number; // Stable zero-based planned unit; older checks use their array position.
   timestamp: string; // ISO string
   exercises?: {
     name: string;
@@ -74,6 +75,7 @@ export interface ExceptionRequest {
    * existed; missing means 'single'.
    */
   kind?: 'single' | 'week';
+  unitIndices?: number[]; // Exact planned units covered by this request (legacy requests omit this).
   slot: number; // which planned unit slot (0-based) is being excused (informational + dedupe)
   reasonCode?: string; // 'krank' | 'reise' | 'termin' | 'verletzung' | 'anderer'
   reasonLabel?: string; // human-readable reason

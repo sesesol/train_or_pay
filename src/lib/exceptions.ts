@@ -15,7 +15,7 @@
  * Storage key: session:{code}:week:{weekKey}:exception:{requesterLower}:{slot}
  */
 
-import { ExceptionRequest, ExceptionStatus } from '../types.ts';
+import { ExceptionRequest, ExceptionStatus, WorkoutCheck } from '../types.ts';
 import { storageGet, storageList } from './storage.ts';
 
 export interface ExceptionReasonOption {
@@ -64,18 +64,6 @@ function byRequester(exceptions: ExceptionRequest[], userLower: string): Excepti
   return exceptions.filter((e) => e.requester.toLowerCase() === u);
 }
 
-/** Approved exceptions for a user in this week -> excused (penalty-free) units. */
-export function countApprovedExcused(exceptions: ExceptionRequest[], userLower: string): number {
-  return byRequester(exceptions, userLower).filter((e) => e.status === 'approved').length;
-}
-
-/** Pending + approved requests already consume open-unit capacity. */
-export function countActiveExceptions(exceptions: ExceptionRequest[], userLower: string): number {
-  return byRequester(exceptions, userLower).filter(
-    (e) => e.status === 'pending' || e.status === 'approved'
-  ).length;
-}
-
 /** True if the user has an emergency week dropout that is pending or approved. */
 export function hasActiveWeekException(
   exceptions: ExceptionRequest[],
@@ -101,36 +89,73 @@ export function hasApprovedWeekException(
  * every remaining open unit; otherwise each approved single request excuses one
  * unit. Always capped at the units still open, so it can never over-credit.
  */
-export function computeExcusedFor(
-  exceptions: ExceptionRequest[],
-  userLower: string,
-  goal: number,
-  completed: number
-): number {
-  const remaining = Math.max(0, (goal || 0) - (completed || 0));
-  if (remaining === 0) return 0;
-  if (hasApprovedWeekException(exceptions, userLower)) return remaining;
-  return Math.min(countApprovedExcused(exceptions, userLower), remaining);
+export type UnitState = { status: 'open' | 'done' | 'pending' | 'excused'; checkIndex?: number };
+
+/** Resolve the exact units once for rendering, requests and settlement. */
+export function getWeekUnits(goal: number, checks: WorkoutCheck[], exceptions: ExceptionRequest[], user: string): UnitState[] {
+  const units: UnitState[] = Array.from({ length: Math.max(0, Math.min(14, Math.floor(goal || 0))) }, () => ({ status: 'open' }));
+  const valid = (i: number) => Number.isInteger(i) && i >= 0 && i < units.length;
+  // Explicit indices retain their positions when a different check is undone.
+  checks.forEach((check, checkIndex) => {
+    if (check.unitIndex !== undefined && valid(check.unitIndex) && units[check.unitIndex].status === 'open') units[check.unitIndex] = { status: 'done', checkIndex };
+  });
+  checks.forEach((check, checkIndex) => {
+    if (check.unitIndex !== undefined) return;
+    const index = units.findIndex(u => u.status === 'open');
+    if (index >= 0) units[index] = { status: 'done', checkIndex };
+  });
+  const own = byRequester(exceptions, user);
+  for (const status of ['approved', 'pending'] as const) {
+    const targetStatus = status === 'approved' ? 'excused' : 'pending';
+    const requests = own.filter(e => e.status === status);
+    // New requests target fixed units. Never move an excuse onto a different day.
+    for (const req of requests.filter(e => e.kind !== 'week' && e.unitIndices !== undefined)) {
+      for (const index of new Set(req.unitIndices)) {
+        if (valid(index) && units[index].status === 'open') units[index] = { status: targetStatus };
+      }
+    }
+    // Legacy single requests remain one unit each, without interpreting slot as a unit index.
+    for (const req of requests.filter(e => e.kind !== 'week' && e.unitIndices === undefined)) {
+      const index = units.findIndex(u => u.status === 'open');
+      if (index >= 0) units[index] = { status: targetStatus };
+    }
+    if (requests.some(e => e.kind === 'week')) {
+      units.forEach((u, i) => { if (u.status === 'open') units[i] = { status: targetStatus }; });
+    }
+  }
+  return units;
 }
 
-/**
- * Build userLower -> excused count for settlement inputs, given each member's
- * week data (goal/completed), which the week-wide dropout depends on.
- */
+/** Reject stale selections rather than silently excusing different units. */
+export function validateSelectedUnits(indices: number[], units: UnitState[]): number[] {
+  const selected = [...new Set(indices)].sort((a, b) => a - b);
+  if (!selected.length || selected.some(i => !Number.isInteger(i) || units[i]?.status !== 'open')) {
+    throw new Error('Bitte offene Einheiten wählen. Bereits erledigte, angefragte oder entschuldigte Einheiten sind nicht auswählbar.');
+  }
+  return selected;
+}
+
+export function exceptionUnitLabel(request: ExceptionRequest): string {
+  if (request.kind === 'week') return 'Restliche Woche';
+  if (!request.unitIndices?.length) return 'Eine Einheit';
+  return `${request.unitIndices.length === 1 ? 'Einheit' : 'Einheiten'} ${request.unitIndices.map(i => i + 1).join(', ')}`;
+}
+
+export function computeExcusedFor(
+  exceptions: ExceptionRequest[], userLower: string, goal: number, completed: number,
+  checks?: WorkoutCheck[]
+): number {
+  const workouts = checks ?? Array.from({ length: completed }, () => ({ timestamp: '' }));
+  return getWeekUnits(goal, workouts, exceptions, userLower).filter(u => u.status === 'excused').length;
+}
+
 export function buildExcusedMap(
   exceptions: ExceptionRequest[],
-  weekDataByUser: Record<string, { goal?: number; checks?: unknown[] } | undefined>
+  weekDataByUser: Record<string, { goal?: number; checks?: WorkoutCheck[] } | undefined>
 ): Record<string, number> {
-  const map: Record<string, number> = {};
-  for (const [user, data] of Object.entries(weekDataByUser)) {
-    map[user] = computeExcusedFor(
-      exceptions,
-      user,
-      data?.goal || 0,
-      data?.checks?.length || 0
-    );
-  }
-  return map;
+  return Object.fromEntries(Object.entries(weekDataByUser).map(([user, data]) => [
+    user, computeExcusedFor(exceptions, user, data?.goal || 0, data?.checks?.length || 0, data?.checks || []),
+  ]));
 }
 
 /** Next free slot index for a requester (guarantees a unique, stable key). */
