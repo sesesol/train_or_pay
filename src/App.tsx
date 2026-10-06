@@ -18,8 +18,11 @@ import {
   storageSet,
   storageList,
   storageGetMany,
+  storageSetIfAbsent,
   storageDelete,
   initWindowStoragePolyfill,
+  ensureServerHydrated,
+  StorageHealth,
 } from './lib/storage.ts';
 import {
   ensureUserId,
@@ -39,8 +42,7 @@ import {
 import {
   getBerlinISOWeek,
   getNextBerlinISOWeek,
-  getPreviousBerlinISOWeek,
-} from './lib/time.ts';
+  getPreviousBerlinISOWeek, weekNumberOf } from './lib/time.ts';
 import { calculateWeekSettlement } from './lib/settlement.ts';
 import { AuthScreen } from './components/AuthScreen.tsx';
 import { SessionSelectModal } from './components/SessionSelectModal.tsx';
@@ -65,6 +67,13 @@ export default function App() {
     let cancelled = false;
 
     const restore = async () => {
+      // First make sure the server holds everything this browser knows. If the
+      // server's store was reset, this re-uploads the locally cached accounts,
+      // groups and progress BEFORE any login lookup could wrongly conclude that
+      // the account or group does not exist.
+      const health = await ensureServerHydrated();
+      if (!cancelled && health) setStorageHealth(health);
+
       const record = readLoginSession();
       if (!record) {
         if (!cancelled) setIsRestoringSession(false);
@@ -150,6 +159,7 @@ export default function App() {
   const [isLoadingSession, setIsLoadingSession] = useState<boolean>(false);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [isRestoringSession, setIsRestoringSession] = useState<boolean>(true);
+  const [storageHealth, setStorageHealth] = useState<StorageHealth | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
   const addToast = (type: 'error' | 'success' | 'info', text: string, onRetry?: () => void) => {
@@ -224,8 +234,7 @@ export default function App() {
       }
       pastWeeksSet.add(getPreviousBerlinISOWeek(currentWeekKey));
 
-      const debtsStore: DebtsStorage = all[`session:${code}:debts`] || { open: [], history: [] };
-      let hasNewSettlements = false;
+      const newDebtItems: DebtItem[] = [];
 
       for (const pastWeek of Array.from(pastWeeksSet).sort()) {
         const settlementKey = `${weekPrefix}${pastWeek}:settlement`;
@@ -256,13 +265,21 @@ export default function App() {
         });
 
         const settlement = calculateWeekSettlement(pastWeek, memberInputs);
-        await storageSet(settlementKey, settlement);
+        // Create-only: when both partners open the app at the same time, only
+        // ONE of them settles the week. Previously both did, which booked the
+        // week's debts twice.
+        const created = await storageSetIfAbsent(settlementKey, settlement);
+        if (!created) {
+          const winner = await storageGet<WeekSettlement>(settlementKey);
+          if (winner) all[settlementKey] = winner;
+          continue;
+        }
         all[settlementKey] = settlement;
-        hasNewSettlements = true;
 
         for (const entry of settlement.entries) {
-          debtsStore.open.push({
-            id: `debt-${code}-${pastWeek}-${entry.from}-${entry.to}-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
+          newDebtItems.push({
+            // Deterministic id -> the same debt can never be booked twice.
+            id: `debt-${code}-${pastWeek}-${entry.from}-${entry.to}`,
             from: entry.from,
             to: entry.to,
             amountCents: entry.amountCents,
@@ -273,9 +290,18 @@ export default function App() {
         }
       }
 
-      if (hasNewSettlements) {
-        await storageSet(`session:${code}:debts`, debtsStore);
-        all[`session:${code}:debts`] = debtsStore;
+      if (newDebtItems.length) {
+        // Re-read right before writing so a payment recorded meanwhile by the
+        // partner is not overwritten, and skip ids that already exist.
+        const debtsKey = `session:${code}:debts`;
+        const fresh: DebtsStorage = (await storageGet<DebtsStorage>(debtsKey)) || { open: [], history: [] };
+        const known = new Set([...fresh.open, ...fresh.history].map((d) => d.id));
+        const merged: DebtsStorage = {
+          open: [...fresh.open, ...newDebtItems.filter((d) => !known.has(d.id))],
+          history: fresh.history,
+        };
+        await storageSet(debtsKey, merged);
+        all[debtsKey] = merged;
       }
     },
     [currentWeekKey]
@@ -293,8 +319,14 @@ export default function App() {
       const code = session.code;
 
       try {
-        // 1. One batch read of the whole session subtree.
-        const all = await storageGetMany(`session:${code}:`);
+        // 1. One batch read. A full refresh loads the whole session subtree; a
+        //    background poll only needs what can change during the week (meta,
+        //    debts, current week), which keeps polls small as history grows.
+        const all = await storageGetMany(
+          silent
+            ? [`session:${code}:meta`, `session:${code}:debts`, `session:${code}:week:${currentWeekKey}:`]
+            : `session:${code}:`
+        );
 
         const freshSession = (all[`session:${code}:meta`] as SessionMeta) || session;
         setCurrentSession(freshSession);
@@ -354,22 +386,26 @@ export default function App() {
           .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
         setWeekExceptions(exceptions);
 
-        // 4. My next week plan
-        setMyNextWeekData(
-          (all[`session:${code}:week:${nextWeekKey}:user:${userLower}`] as UserWeekData) || null
-        );
+        // 4. My next week plan (not part of the lightweight poll)
+        if (!silent) {
+          setMyNextWeekData(
+            (all[`session:${code}:week:${nextWeekKey}:user:${userLower}`] as UserWeekData) || null
+          );
+        }
 
         // 5. Debts
         const debtsStore = all[`session:${code}:debts`] as DebtsStorage | undefined;
         setOpenDebts(debtsStore?.open || []);
         setPaymentHistory(debtsStore?.history || []);
 
-        // 6. All past settlements for history
-        const loadedSettlements: WeekSettlement[] = Object.keys(all)
-          .filter((k) => k.endsWith(':settlement'))
-          .map((k) => all[k])
-          .filter(Boolean);
-        setSettlements(loadedSettlements);
+        // 6. All past settlements for history (not part of the lightweight poll)
+        if (!silent) {
+          const loadedSettlements: WeekSettlement[] = Object.keys(all)
+            .filter((k) => k.endsWith(':settlement'))
+            .map((k) => all[k])
+            .filter(Boolean);
+          setSettlements(loadedSettlements);
+        }
       } catch (err: any) {
         if (!silent) {
           addToast(
@@ -838,7 +874,7 @@ export default function App() {
     setOpenDebts(filteredOpen);
     setSettlements((prev) => [settlement, ...prev.filter((s) => s.weekKey !== weekKey)]);
 
-    addToast('success', `Kassenabschluss für KW ${weekKey.replace('2026-W', '')} erfolgreich verbucht!`);
+    addToast('success', `Kassenabschluss für KW ${weekNumberOf(weekKey)} erfolgreich verbucht!`);
     await refreshSessionData(currentSession, usernameLower);
     return settlement;
   };
@@ -1116,6 +1152,7 @@ export default function App() {
                 onError={(msg) => addToast('error', msg)}
                 onSuccess={(msg) => addToast('success', msg)}
                 onSeedDemoGroup={handleSeedDemoGroup}
+                storageHealth={storageHealth}
               />
             )}
           </>

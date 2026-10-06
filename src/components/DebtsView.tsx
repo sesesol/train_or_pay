@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { DebtItem, SessionMeta, UserProfile, UserWeekData, WeekSettlement } from '../types.ts';
 import { formatEuro, parseEuroToCents, calculateWeekSettlement } from '../lib/settlement.ts';
-import { formatBerlinDateTime } from '../lib/time.ts';
+import { formatBerlinDateTime, weekNumberOf } from '../lib/time.ts';
 
 interface DebtsViewProps {
   session: SessionMeta;
@@ -87,7 +87,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
     return {
       user: mLower,
       displayName: m.displayName,
-      goal: uData ? uData.goal : 3,
+      goal: uData ? uData.goal : 0, // no plan = paused (spec 6.1), never a phantom goal
       completed: uData ? (uData.checks?.length || 0) : 0,
       penaltyCents: uData?.penaltyCentsSnapshot || m.penaltyCents,
       joinedMidWeek: uData?.joinedMidWeek || false,
@@ -242,7 +242,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
     try {
       await onRunKassenabschluss(currentWeekKey);
       setShowKassenabschlussModal(false);
-      onSuccess(`Kassenabschluss für KW ${currentWeekKey.replace('2026-W', '')} erfolgreich ausgeführt!`);
+      onSuccess(`Kassenabschluss für KW ${weekNumberOf(currentWeekKey)} erfolgreich ausgeführt!`);
     } catch (e: any) {
       onError('Fehler beim Kassenabschluss: ' + (e?.message || ''));
     } finally {
@@ -342,7 +342,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
             </div>
           </div>
           <span className="text-[11px] font-mono font-bold text-[#DFFF00] bg-[#DFFF00]/10 px-2.5 py-1 rounded-lg border border-[#DFFF00]/20">
-            KW {currentWeekKey.replace('2026-W', '')}
+            KW {weekNumberOf(currentWeekKey)}
           </span>
         </button>
 
@@ -443,7 +443,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
                         >
                           <div className="flex flex-col min-w-0">
                             <span className="font-black text-white font-mono uppercase tracking-wider">
-                              KW {item.weekKey.replace('2026-W', '')}
+                              KW {weekNumberOf(item.weekKey)}
                             </span>
                             <span className="text-[11px] text-white/50 mt-0.5">
                               {itemIOwe ? 'Du zahlst an ' + otherName : otherName + ' zahlt an dich'}
@@ -554,7 +554,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
                     <strong className="text-white font-black">{getDisplayName(item.to)}</strong>
                   </span>
                   <span className="text-[10px] text-white/40 font-mono mt-0.5 uppercase tracking-wider">
-                    {item.paidAt ? formatBerlinDateTime(item.paidAt) : 'Beglichen'} • KW {item.weekKey.replace('2026-W', '')}
+                    {item.paidAt ? formatBerlinDateTime(item.paidAt) : 'Beglichen'} • KW {weekNumberOf(item.weekKey)}
                   </span>
                 </div>
                 <span className="font-black text-[#DFFF00] font-mono">
@@ -586,7 +586,7 @@ export const DebtsView: React.FC<DebtsViewProps> = ({
                 <h3 className="font-black text-lg uppercase tracking-tight">Kassenabschluss durchführen</h3>
               </div>
               <span className="text-xs font-mono font-black text-[#DFFF00] bg-[#DFFF00]/10 px-2.5 py-1 rounded-lg border border-[#DFFF00]/20">
-                KW {currentWeekKey.replace('2026-W', '')}
+                KW {weekNumberOf(currentWeekKey)}
               </span>
             </div>
 

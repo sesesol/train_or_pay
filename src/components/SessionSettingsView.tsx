@@ -20,6 +20,7 @@ import {
   CheckCircle,
 } from 'lucide-react';
 import { SessionMeta, UserProfile, DebtItem } from '../types.ts';
+import { StorageHealth } from '../lib/storage.ts';
 import { formatEuro } from '../lib/settlement.ts';
 import { ConfirmModal } from './Modal.tsx';
 import { hasUserOpenDebts } from '../lib/settlement.ts';
@@ -37,6 +38,7 @@ interface SessionSettingsViewProps {
   onError: (msg: string) => void;
   onSuccess: (msg: string) => void;
   onSeedDemoGroup: () => Promise<void>;
+  storageHealth?: StorageHealth | null;
 }
 
 export const SessionSettingsView: React.FC<SessionSettingsViewProps> = ({
@@ -52,6 +54,7 @@ export const SessionSettingsView: React.FC<SessionSettingsViewProps> = ({
   onError,
   onSuccess,
   onSeedDemoGroup,
+  storageHealth,
 }) => {
   const [copiedInvite, setCopiedInvite] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -151,6 +154,39 @@ export const SessionSettingsView: React.FC<SessionSettingsViewProps> = ({
 
   return (
     <div className="flex flex-col gap-6 pb-12 animate-in fade-in duration-200">
+      {/* Storage durability status: makes a non-persistent setup visible
+          instead of silently losing groups after some idle time. */}
+      {storageHealth && (
+        <div
+          id="storage-health-status"
+          className={`p-4 rounded-2xl border text-xs flex items-start gap-3 ${
+            storageHealth.durable
+              ? 'bg-[#DFFF00]/5 border-[#DFFF00]/20 text-white/70'
+              : 'bg-red-500/10 border-red-500/30 text-red-200'
+          }`}
+        >
+          {storageHealth.durable ? (
+            <CheckCircle className="w-4 h-4 text-[#DFFF00] shrink-0 mt-0.5" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+          )}
+          <div className="leading-relaxed">
+            <strong className={storageHealth.durable ? 'text-white' : 'text-red-300'}>
+              {storageHealth.durable
+                ? `Datenspeicher: dauerhaft (${storageHealth.backend === 'firestore' ? 'Firestore' : 'persistentes Volume'})`
+                : 'Datenspeicher: NICHT dauerhaft'}
+            </strong>
+            {!storageHealth.durable && (
+              <p className="mt-1 text-red-200/80">
+                Gruppen und Konten können bei einem Server-Neustart verloren gehen. Die App stellt sie
+                aus den Daten auf euren Geräten automatisch wieder her — dauerhaft sicher ist das aber nur
+                mit einer echten Datenbank (Firestore aktivieren).
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Session Overview Card */}
       <div className="bg-white/5 border border-white/10 rounded-3xl p-6 sm:p-7 shadow-xl flex flex-col gap-5">
         <div className="flex items-start justify-between">

@@ -265,3 +265,14 @@ export function getGermanDayName(dayOfWeek: number): string {
   const names = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag'];
   return names[dayOfWeek - 1] || 'Heute';
 }
+
+/** "2026-W07" -> "7" (ISO week number, no hardcoded year). */
+export function weekNumberOf(weekKey: string): string {
+  const w = weekKey.split('-W')[1];
+  return w ? String(parseInt(w, 10)) : weekKey;
+}
+
+/** "2026-W07" -> "2026" (ISO week-numbering year). */
+export function weekYearOf(weekKey: string): string {
+  return weekKey.split('-W')[0] || '';
+}

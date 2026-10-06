@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import confetti from 'canvas-confetti';
 import {
   Check,
@@ -46,8 +46,7 @@ import {
   formatBerlinDate,
   isSameBerlinDay,
   getDaysRemainingInWeek,
-  getGermanDayName,
-} from '../lib/time.ts';
+  getGermanDayName, weekNumberOf, weekYearOf } from '../lib/time.ts';
 import { formatEuro } from '../lib/settlement.ts';
 import { storageSet } from '../lib/storage.ts';
 
@@ -104,6 +103,12 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
     myNextWeekData ? myNextWeekData.goal : 3
   );
   const [isEditingNextWeek, setIsEditingNextWeek] = useState<boolean>(false);
+
+  // The saved plan usually arrives after the first render; keep the selector in
+  // sync with it instead of showing the hard default.
+  useEffect(() => {
+    if (myNextWeekData) setNextWeekGoal(myNextWeekData.goal);
+  }, [myNextWeekData?.goal]);
 
   const daysRemaining = getDaysRemainingInWeek(now);
   const weekRange = getWeekDateRange(currentWeekKey);
@@ -238,7 +243,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
           <div className="flex flex-col">
             <span className="text-xs uppercase tracking-[0.2em] text-[#DFFF00] font-bold">Aktuelle Trainingswoche</span>
             <span className="text-sm sm:text-base font-black font-mono text-white tracking-wider uppercase mt-0.5">
-              KW {currentWeekKey.replace('2026-W', '')} — 2026 • {weekRange.fullRange}
+              KW {weekNumberOf(currentWeekKey)} — {weekYearOf(currentWeekKey)} • {weekRange.fullRange}
             </span>
           </div>
           <span className="px-3 py-1 bg-white/10 border border-white/10 text-white rounded-full text-xs font-mono font-bold uppercase tracking-wider flex items-center gap-1.5">
@@ -590,7 +595,7 @@ export const ThisWeekView: React.FC<ThisWeekViewProps> = ({
             <h3 className="text-base font-black uppercase tracking-tight text-white">Nächste Woche planen & bearbeiten</h3>
           </div>
           <span className="text-xs font-mono font-black text-[#DFFF00] bg-[#DFFF00]/10 border border-[#DFFF00]/20 px-2.5 py-1 rounded-lg uppercase tracking-wider">
-            KW {nextWeekKey.replace('2026-W', '')} • {nextWeekRange.fullRange}
+            KW {weekNumberOf(nextWeekKey)} • {nextWeekRange.fullRange}
           </span>
         </div>
 

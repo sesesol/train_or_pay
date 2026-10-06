@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { WeekSettlement, SessionMeta, UserProfile } from '../types.ts';
 import { formatEuro, calculateWeekSettlement } from '../lib/settlement.ts';
-import { getWeekDateRange } from '../lib/time.ts';
+import { getWeekDateRange, weekNumberOf, weekYearOf } from '../lib/time.ts';
 
 interface HistoryStatsViewProps {
   session: SessionMeta;
@@ -279,7 +279,7 @@ export const HistoryStatsView: React.FC<HistoryStatsViewProps> = ({
                   >
                     <div className="flex flex-col">
                       <span className="font-black text-white text-base font-mono uppercase tracking-wider">
-                        KW {settlement.weekKey.replace('2026-W', '')} — 2026
+                        KW {weekNumberOf(settlement.weekKey)} — {weekYearOf(settlement.weekKey)}
                       </span>
                       <span className="text-xs text-white/50 font-mono mt-0.5">{range.fullRange}</span>
                     </div>
