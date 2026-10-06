@@ -293,9 +293,9 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess, onError 
                 <div className="w-12 h-12 mx-auto rounded-2xl bg-white/10 flex items-center justify-center text-[#DFFF00] mb-3">
                   <Lock className="w-6 h-6" />
                 </div>
-                <h3 className="text-lg font-black uppercase tracking-tight text-white">PIN für „{pendingProfile?.displayName}“</h3>
+                <h3 className="text-lg font-black uppercase tracking-tight text-white">PIN / Passwort für „{pendingProfile?.displayName}“</h3>
                 <p className="text-xs text-white/50 mt-1">
-                  Dieses Konto ist mit einer 4-stelligen PIN geschützt.
+                  Dieses Konto ist mit einer 4-stelligen PIN (Passwort) geschützt.
                 </p>
               </div>
 
@@ -361,13 +361,13 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess, onError 
                 </div>
                 <h3 className="text-lg font-black uppercase tracking-tight text-white">Willkommen, {pendingProfile?.displayName}!</h3>
                 <p className="text-xs text-white/50 mt-1">
-                  Möchtest du eine optionale 4-stellige PIN setzen, um versehentliches Übernehmen zu vermeiden?
+                  Möchtest du eine 4-stellige PIN (Passwort) setzen, um versehentliches Übernehmen zu vermeiden?
                 </p>
               </div>
 
               <div>
                 <label className="block text-[10px] uppercase tracking-[0.2em] font-black text-white/40 mb-2">
-                  4-stellige PIN (optional)
+                  4-stellige PIN / Passwort (optional)
                 </label>
                 <input
                   type="password"
@@ -397,7 +397,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onLoginSuccess, onError 
                     onClick={() => handleFinishCreateUser(true)}
                     className="w-full min-h-[48px] py-3 px-4 bg-[#DFFF00] hover:scale-[1.02] active:scale-95 text-black font-black uppercase tracking-wider rounded-2xl text-xs transition-all cursor-pointer shadow-lg"
                   >
-                    Mit PIN speichern & starten
+                    Mit PIN / Passwort speichern
                   </button>
                 ) : (
                   <button

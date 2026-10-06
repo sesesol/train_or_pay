@@ -12,6 +12,7 @@ import {
   DebtItem,
   DebtsStorage,
   ExceptionRequest,
+  SessionMember,
 } from './types.ts';
 import {
   storageGet,
@@ -176,16 +177,69 @@ export default function App() {
 
   // Load user sessions list from storage (thorough scan to ensure zero data loss)
   const loadUserSessions = useCallback(
-    async (userLower: string): Promise<SessionMeta[]> => {
+    async (userLower: string, profile?: UserProfile | null): Promise<SessionMeta[]> => {
       const loadedMap = new Map<string, SessionMeta>();
 
-      // Group membership is authoritative, not a stale profile's list of codes.
-      const metas = await storageGetMany('session:', ':meta');
-      for (const [key, value] of Object.entries(metas)) {
-        const meta = value as SessionMeta;
-        if (key.endsWith(':meta') && meta?.code && meta.members?.some(m =>
-          m.active && m.user.toLowerCase() === userLower.toLowerCase()
-        )) loadedMap.set(meta.code, meta);
+      // 1. Directly fetch any session codes recorded in the user profile
+      const profileCodes = profile?.sessions || [];
+      for (const rawCode of profileCodes) {
+        const cleanCode = rawCode?.trim()?.toUpperCase();
+        if (!cleanCode) continue;
+        try {
+          const meta = await storageGet<SessionMeta>(`session:${cleanCode}:meta`);
+          if (meta && meta.code) {
+            loadedMap.set(meta.code, meta);
+          }
+        } catch (_e) {
+          // ignore individual read error
+        }
+      }
+
+      // 2. Scan all session metas from storage for active membership or admin ownership
+      try {
+        const metas = await storageGetMany('session:', ':meta');
+        for (const [key, value] of Object.entries(metas)) {
+          const meta = value as SessionMeta;
+          if (!meta || !meta.code || !key.endsWith(':meta')) continue;
+          const isAdmin = meta.adminUser?.toLowerCase() === userLower.toLowerCase();
+          const isMember = meta.members?.some((m) =>
+            m && (
+              (m.user?.toLowerCase() === userLower.toLowerCase() && m.active !== false) ||
+              (profile?.id && m.userId === profile.id && m.active !== false)
+            )
+          );
+          if (isAdmin || isMember) {
+            loadedMap.set(meta.code, meta);
+          }
+        }
+      } catch (_e) {
+        // If batch scan fails, keep any already loaded from profileCodes
+      }
+
+      // 3. Auto-heal: Ensure user is registered as an active member in each session they own/participate in
+      for (const [code, meta] of loadedMap.entries()) {
+        const hasMember = meta.members?.some((m) =>
+          m && (
+            m.user?.toLowerCase() === userLower.toLowerCase() ||
+            (profile?.id && m.userId === profile.id)
+          )
+        );
+        if (!hasMember && meta.adminUser?.toLowerCase() === userLower.toLowerCase()) {
+          const repairedMember: SessionMember = {
+            user: userLower,
+            userId: profile?.id,
+            displayName: profile?.displayName || userLower,
+            joinedAt: meta.createdAt || new Date().toISOString(),
+            penaltyCents: 500,
+            active: true,
+          };
+          const healedMeta: SessionMeta = {
+            ...meta,
+            members: [...(meta.members || []), repairedMember],
+          };
+          loadedMap.set(code, healedMeta);
+          storageSet(`session:${code}:meta`, healedMeta).catch(() => {});
+        }
       }
 
       return Array.from(loadedMap.values());
@@ -483,8 +537,17 @@ export default function App() {
 
     setIsLoadingSession(true);
     try {
-      const sessions = await loadUserSessions(userLower);
+      const sessions = await loadUserSessions(userLower, ensuredProfile);
       setUserSessions(sessions);
+
+      // Keep user profile sessions list synchronized with found sessions
+      const foundCodes = sessions.map((s) => s.code);
+      const mergedCodes = Array.from(new Set([...(ensuredProfile.sessions || []), ...foundCodes]));
+      if (mergedCodes.length !== (ensuredProfile.sessions?.length || 0)) {
+        const synced = { ...ensuredProfile, sessions: mergedCodes };
+        setCurrentUser(synced);
+        storageSet(`user:${userLower}`, synced).catch(() => {});
+      }
 
       if (prefillCode) {
         // User clicked invite link
@@ -1163,9 +1226,19 @@ export default function App() {
           onSessionCreatedOrJoined={(s) => {
             setCurrentSession(s);
             setUserSessions((prev) => [s, ...prev.filter((p) => p.code !== s.code)]);
+            setCurrentUser((prev) =>
+              prev ? { ...prev, sessions: Array.from(new Set([...(prev.sessions || []), s.code])) } : prev
+            );
             setShowSessionModal(false);
             refreshSessionData(s, usernameLower);
             addToast('success', `Session „${s.name}“ geöffnet!`);
+          }}
+          onRefreshSessions={async () => {
+            if (currentUser && usernameLower) {
+              const fresh = await loadUserSessions(usernameLower, currentUser);
+              setUserSessions(fresh);
+              addToast('success', `${fresh.length} ${fresh.length === 1 ? 'Gruppe' : 'Gruppen'} gefunden`);
+            }
           }}
           onError={(msg) => addToast('error', msg)}
           onLogout={() => {

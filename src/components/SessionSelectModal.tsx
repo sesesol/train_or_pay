@@ -6,7 +6,7 @@
 import React, { useState } from 'react';
 import { Plus, LogIn, Users, Shield, ArrowRight, AlertTriangle, Sparkles, Check } from 'lucide-react';
 import { SessionMeta, SessionMember, UserProfile } from '../types.ts';
-import { storageGet, storageSet } from '../lib/storage.ts';
+import { storageGet, storageSet, storageGetMany } from '../lib/storage.ts';
 import { formatEuro } from '../lib/settlement.ts';
 import { getBerlinParts, getBerlinISOWeek } from '../lib/time.ts';
 
@@ -20,6 +20,7 @@ interface SessionSelectModalProps {
   onSessionCreatedOrJoined: (session: SessionMeta) => void;
   onError: (msg: string) => void;
   onLogout: () => void;
+  onRefreshSessions?: () => Promise<void> | void;
 }
 
 // Characters allowed: uppercase letters + digits without 0, O, 1, I, L
@@ -33,6 +34,14 @@ function generateJoinCode(): string {
   return result;
 }
 
+function extractCode(input: string): string {
+  const trimmed = input.trim();
+  const urlMatch = trimmed.match(/join=([A-Za-z0-9]+)/i);
+  if (urlMatch && urlMatch[1]) return urlMatch[1].toUpperCase().slice(0, 6);
+  const cleaned = trimmed.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  return cleaned.slice(0, 6);
+}
+
 export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
   currentUser,
   usernameLower,
@@ -43,14 +52,16 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
   onSessionCreatedOrJoined,
   onError,
   onLogout,
+  onRefreshSessions,
 }) => {
   const [tab, setTab] = useState<'list' | 'create' | 'join'>(
-    prefillCode ? 'join' : sessions.length === 0 ? 'join' : 'list'
+    prefillCode ? 'join' : sessions.length === 0 ? 'list' : 'list'
   );
   const [sessionName, setSessionName] = useState('');
-  const [joinCodeInput, setJoinCodeInput] = useState(prefillCode || '');
+  const [joinCodeInput, setJoinCodeInput] = useState(prefillCode ? extractCode(prefillCode) : '');
   const [penaltyEuro, setPenaltyEuro] = useState<number>(5.0); // 5.00 € default
   const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshingList, setIsRefreshingList] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const handleCreateSession = async () => {
@@ -123,25 +134,55 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
 
   const handleJoinSession = async () => {
     setErrorMsg(null);
-    const cleanCode = joinCodeInput.trim().toUpperCase();
-    if (!cleanCode) {
-      setErrorMsg('Bitte gib einen 6-stelligen Beitritts-Code ein.');
+    const cleanCode = extractCode(joinCodeInput);
+    if (!cleanCode || cleanCode.length < 6) {
+      setErrorMsg('Bitte gib einen vollständigen 6-stelligen Beitritts-Code ein.');
       return;
     }
 
     setIsLoading(true);
     try {
-      const session = await storageGet<SessionMeta>(`session:${cleanCode}:meta`);
+      let session = await storageGet<SessionMeta>(`session:${cleanCode}:meta`);
+
+      // Try character ambiguity fixes (0 vs O, 1 vs I)
       if (!session) {
-        setErrorMsg(`Keine Session mit dem Code "${cleanCode}" gefunden.`);
+        const alt1 = cleanCode.replace(/0/g, 'O').replace(/1/g, 'I');
+        if (alt1 !== cleanCode) session = await storageGet<SessionMeta>(`session:${alt1}:meta`);
+      }
+      if (!session) {
+        const alt2 = cleanCode.replace(/O/g, '0').replace(/I/g, '1');
+        if (alt2 !== cleanCode) session = await storageGet<SessionMeta>(`session:${alt2}:meta`);
+      }
+
+      // Try fallback scan over all sessions
+      if (!session) {
+        try {
+          const allMetas = await storageGetMany('session:', ':meta');
+          for (const s of Object.values(allMetas)) {
+            const m = s as SessionMeta;
+            if (m?.code?.toUpperCase() === cleanCode || m?.code?.toUpperCase() === cleanCode.replace(/0/g, 'O')) {
+              session = m;
+              break;
+            }
+          }
+        } catch (_e) {}
+      }
+
+      if (!session) {
+        setErrorMsg(`Keine Session mit dem Code „${cleanCode}“ gefunden. Bitte prüfe die Eingabe oder erstelle eine neue Gruppe.`);
         setIsLoading(false);
         return;
       }
 
-      // Check if already a member
-      const existingMember = session.members.find((m) => m.user.toLowerCase() === usernameLower);
+      const effectiveCode = session.code || cleanCode;
+
+      // Check if already a member or admin
+      const existingMember = session.members.find((m) =>
+        m.user.toLowerCase() === usernameLower ||
+        (currentUser.id && m.userId === currentUser.id)
+      );
+
       if (existingMember) {
-        // Re-activate if was inactive and/or backfill the permanent user id.
         let changed = false;
         if (!existingMember.active) {
           existingMember.active = true;
@@ -151,12 +192,16 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
           existingMember.userId = currentUser.id;
           changed = true;
         }
+        if (existingMember.displayName !== currentUser.displayName) {
+          existingMember.displayName = currentUser.displayName;
+          changed = true;
+        }
         if (changed) {
-          await storageSet(`session:${cleanCode}:meta`, session);
+          await storageSet(`session:${effectiveCode}:meta`, session);
         }
         // Repair the profile index when an existing member joins from another device.
         await storageSet(`user:${usernameLower}`, {
-          ...currentUser, sessions: Array.from(new Set([...(currentUser.sessions || []), cleanCode])),
+          ...currentUser, sessions: Array.from(new Set([...(currentUser.sessions || []), effectiveCode])),
         });
         onSessionCreatedOrJoined(session);
         setIsLoading(false);
@@ -187,14 +232,12 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
         members: updatedMembers,
       };
 
-      await storageSet(`session:${cleanCode}:meta`, updatedSession);
+      await storageSet(`session:${effectiveCode}:meta`, updatedSession);
 
-      // Section 5.2/11: joining mid-week (Tue-Sun) means no participation in the
-      // running week -> explicitly persist goal 0 / no penalty / no payout, rather
-      // than relying on a fallback default that could drift out of sync later.
+      // Section 5.2/11: joining mid-week (Tue-Sun) means no participation in running week
       if (isMidWeek) {
         const joinWeekKey = getBerlinISOWeek(new Date());
-        await storageSet(`session:${cleanCode}:week:${joinWeekKey}:user:${usernameLower}`, {
+        await storageSet(`session:${effectiveCode}:week:${joinWeekKey}:user:${usernameLower}`, {
           goal: 0,
           checks: [],
           penaltyCentsSnapshot: penaltyCents,
@@ -204,7 +247,7 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
       }
 
       // Add to user profile sessions
-      const updatedUserSessions = Array.from(new Set([...(currentUser.sessions || []), cleanCode]));
+      const updatedUserSessions = Array.from(new Set([...(currentUser.sessions || []), effectiveCode]));
       const updatedProfile: UserProfile = {
         ...currentUser,
         sessions: updatedUserSessions,
@@ -232,10 +275,14 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 pb-4">
           <div>
-            <h2 className="text-xl font-black uppercase tracking-tight text-white">Gruppen & Sessions</h2>
-            <p className="text-xs text-white/50 mt-0.5">
-              Angemeldet als: <span className="text-[#DFFF00] font-black uppercase">{currentUser.displayName}</span>
-            </p>
+            <h2 className="text-xl font-black uppercase tracking-tight text-white">Mein Profil & Gruppen</h2>
+            <div className="flex items-center gap-1.5 mt-0.5">
+              <span className="text-xs text-white/50">Angemeldet als:</span>
+              <span className="text-xs text-[#DFFF00] font-black uppercase">{currentUser.displayName}</span>
+              {currentUser.pinHash && (
+                <span className="text-[10px] px-1.5 py-0.2 bg-white/10 text-white/70 rounded-md font-mono">PIN geschützt</span>
+              )}
+            </div>
           </div>
           <button
             type="button"
@@ -260,7 +307,7 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
               tab === 'list' ? 'bg-white/15 text-white shadow-sm' : 'text-white/40 hover:text-white'
             }`}
           >
-            Gruppen ({sessions.length})
+            Meine Gruppen ({sessions.length})
           </button>
           <button
             type="button"
@@ -303,11 +350,11 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
             {sessions.length === 0 ? (
               <div className="py-8 text-center flex flex-col items-center gap-2 text-white/50">
                 <Users className="w-10 h-10 text-white/20 mb-1" />
-                <p className="text-sm font-black uppercase tracking-wider text-white">Noch keiner Session beigetreten</p>
+                <p className="text-sm font-black uppercase tracking-wider text-white">Noch keine Gruppe verknüpft</p>
                 <p className="text-xs text-white/40 max-w-xs">
-                  Erstelle jetzt deine eigene Freundesgruppe oder tritt mit einem Code bei.
+                  Erstelle jetzt deine eigene Gruppe oder tritt mit einem 6-stelligen Code bei.
                 </p>
-                <div className="flex gap-2 mt-4">
+                <div className="flex flex-wrap justify-center gap-2 mt-4">
                   <button
                     type="button"
                     onClick={() => setTab('join')}
@@ -322,10 +369,46 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
                   >
                     Neue Gruppe
                   </button>
+                  {onRefreshSessions && (
+                    <button
+                      type="button"
+                      disabled={isRefreshingList}
+                      onClick={async () => {
+                        setIsRefreshingList(true);
+                        try {
+                          await onRefreshSessions();
+                        } finally {
+                          setIsRefreshingList(false);
+                        }
+                      }}
+                      className="px-3.5 py-2.5 bg-white/5 hover:bg-white/10 text-white/70 text-xs font-bold uppercase tracking-wider rounded-xl cursor-pointer transition-colors"
+                    >
+                      {isRefreshingList ? 'Lädt...' : 'Gruppen suchen'}
+                    </button>
+                  )}
                 </div>
               </div>
             ) : (
               <div className="flex flex-col gap-2.5">
+                {onRefreshSessions && (
+                  <div className="flex justify-end pb-1">
+                    <button
+                      type="button"
+                      disabled={isRefreshingList}
+                      onClick={async () => {
+                        setIsRefreshingList(true);
+                        try {
+                          await onRefreshSessions();
+                        } finally {
+                          setIsRefreshingList(false);
+                        }
+                      }}
+                      className="text-[11px] font-bold text-white/50 hover:text-[#DFFF00] transition-colors cursor-pointer"
+                    >
+                      {isRefreshingList ? 'Synchronisiere...' : '↻ Gruppen synchronisieren'}
+                    </button>
+                  </div>
+                )}
                 {sessions.map((s) => {
                   const isAdmin = s.adminUser.toLowerCase() === usernameLower;
                   const activeMembers = s.members.filter((m) => m.active);
@@ -385,17 +468,26 @@ export const SessionSelectModal: React.FC<SessionSelectModalProps> = ({
           <div className="flex flex-col gap-4">
             <div>
               <label className="block text-[10px] uppercase tracking-[0.2em] font-black text-white/40 mb-2">
-                6-stelliger Beitritts-Code
+                6-stelliger Beitritts-Code (oder Einladungslink)
               </label>
               <input
                 type="text"
                 id="session-join-code-input"
-                maxLength={6}
                 value={joinCodeInput}
-                onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
+                onChange={(e) => setJoinCodeInput(extractCode(e.target.value))}
+                onPaste={(e) => {
+                  const pasted = e.clipboardData.getData('text');
+                  if (pasted) {
+                    e.preventDefault();
+                    setJoinCodeInput(extractCode(pasted));
+                  }
+                }}
                 placeholder="z. B. AB7K9X"
                 className="w-full text-center uppercase tracking-widest font-mono font-black text-2xl px-4 py-3.5 bg-black/50 border border-white/15 rounded-2xl text-[#DFFF00] focus:outline-hidden focus:border-[#DFFF00]"
               />
+              <p className="text-[11px] text-white/40 mt-1.5 text-center">
+                Tipp: Du kannst auch den gesamten Einladungslink oder Text einfügen.
+              </p>
             </div>
 
             {/* Penalty Rate Setting */}
