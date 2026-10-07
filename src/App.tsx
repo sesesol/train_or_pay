@@ -430,23 +430,48 @@ export default function App() {
   // Auto-sync: because this key-value backend has no realtime push, poll the
   // shared session on an interval and whenever the tab regains focus, so each
   // partner reliably sees the other's latest checks and exception decisions.
+  // Polling stops once the user has been idle for a while (e.g. a tab left
+  // open on a desktop), so an unattended browser cannot keep consuming the
+  // database's free daily quota. Any interaction resumes it immediately.
   useEffect(() => {
     if (!currentSession || !usernameLower) return;
+    const IDLE_AFTER_MS = 10 * 60 * 1000;
+    let lastActivity = Date.now();
+
     const doSync = () => {
       if (typeof document !== 'undefined' && document.hidden) return;
       const fn = refreshRef.current;
       if (fn) fn(currentSession, usernameLower, true).catch(() => {});
     };
-    const interval = window.setInterval(doSync, 15000);
-    const onVisibility = () => {
-      if (typeof document !== 'undefined' && !document.hidden) doSync();
+    const tick = () => {
+      if (Date.now() - lastActivity < IDLE_AFTER_MS) doSync();
     };
+    const onActivity = () => {
+      const wasIdle = Date.now() - lastActivity >= IDLE_AFTER_MS;
+      lastActivity = Date.now();
+      if (wasIdle) doSync(); // catch up right away after an idle period
+    };
+    const onVisibility = () => {
+      if (typeof document !== 'undefined' && !document.hidden) {
+        lastActivity = Date.now();
+        doSync();
+      }
+    };
+    const onFocus = () => {
+      lastActivity = Date.now();
+      doSync();
+    };
+
+    const interval = window.setInterval(tick, 15000);
+    const activityEvents = ['pointerdown', 'keydown', 'touchstart', 'scroll'];
+    activityEvents.forEach((e) => window.addEventListener(e, onActivity, { passive: true }));
     document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('focus', doSync);
+    window.addEventListener('focus', onFocus);
     return () => {
       window.clearInterval(interval);
+      activityEvents.forEach((e) => window.removeEventListener(e, onActivity));
       document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('focus', doSync);
+      window.removeEventListener('focus', onFocus);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSession?.code, usernameLower]);

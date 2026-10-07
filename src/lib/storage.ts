@@ -27,7 +27,6 @@ declare global {
 const LOCAL_STORAGE_PREFIX = 'tz_gym_storage_';
 const META_EPOCH = 'tz_gym_meta_restored_epoch';
 const META_RESTORED_AT = 'tz_gym_meta_restored_at';
-const DURABLE_RESYNC_MS = 24 * 60 * 60 * 1000;
 const clientFallbackMap: Record<string, string> = {};
 
 // Local storage helper
@@ -174,7 +173,7 @@ export async function ensureServerHydrated(timeoutMs = 8000): Promise<StorageHea
       const lastEpoch = readMeta(META_EPOCH);
       const lastAt = Number(readMeta(META_RESTORED_AT) || 0);
       const needed = h.durable
-        ? Date.now() - lastAt > DURABLE_RESYNC_MS // periodic safety net / one-time migration
+        ? lastAt === 0 // durable store: one-time migration of this browser's data only
         : lastEpoch !== h.startedAt; // a non-durable store restarted -> restore now
       if (needed) await rehydrateServerFromCache(h.startedAt);
       return h;
