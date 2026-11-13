@@ -1,0 +1,113 @@
+{
+  "entities": {
+    "StorageRecord": {
+      "title": "StorageRecord",
+      "description": "Authoritative key-value record for users, groups, weekly workout logs, exceptions, and settlements.",
+      "type": "object",
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[a-zA-Z0-9_:\\-\\.äöüÄÖÜß\\s]+$",
+          "description": "Logical storage key such as user:name or session:CODE:meta"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 900000,
+          "description": "Serialized JSON record value"
+        },
+        "prefix": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Top-level key namespace (user, session, recent)"
+        },
+        "updatedAt": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 64,
+          "description": "ISO-8601 timestamp of the write operation"
+        }
+      },
+      "required": ["key", "value", "prefix", "updatedAt"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Authenticated user profile metadata.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Permanent user UID"
+        },
+        "usernameLower": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 20,
+          "pattern": "^[a-z0-9äöüß_\\-\\s]+$",
+          "description": "Normalized lowercase username"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 20,
+          "description": "Human-readable display name"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 64,
+          "description": "Creation server timestamp"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 64,
+          "description": "Last update server timestamp"
+        }
+      },
+      "required": ["id", "usernameLower", "displayName", "createdAt", "updatedAt"]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Trusted administrator registry entry.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Administrator UID"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "maxLength": 64,
+          "description": "Creation timestamp"
+        }
+      },
+      "required": ["uid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/app_storage/{recordId}": {
+      "schema": "StorageRecord",
+      "description": "Persistent cross-device storage records for users, training groups, workouts, exceptions, and settlements."
+    },
+    "/users/{userId}": {
+      "schema": "UserAccount",
+      "description": "Authenticated user profiles isolated by owner UID."
+    },
+    "/admins/{adminId}": {
+      "schema": "AdminRecord",
+      "description": "System administrator registry."
+    }
+  }
+}
